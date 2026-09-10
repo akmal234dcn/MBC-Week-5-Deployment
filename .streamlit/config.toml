@@ -1,9 +1,18 @@
 [theme]
-primaryColor = "#2F5BEA"
-backgroundColor = "#F4F6FA"
+base = "light"
+primaryColor = "#2C4FB8"
+backgroundColor = "#EEF1F5"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#172033"
-font = "sans serif"
+borderColor = "#D6DCE6"
+baseRadius = "6px"
+font = "Atkinson Hyperlegible:https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap, sans-serif"
+headingFont = "Bricolage Grotesque:https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&display=swap, sans-serif"
+chartCategoricalColors = ["#172033", "#C8283E", "#2C4FB8", "#E0A21B", "#3F8F6B", "#7A5AC8"]
+
+[client]
+toolbarMode = "minimal"
 
 [server]
 headless = true
+maxUploadSize = 50
