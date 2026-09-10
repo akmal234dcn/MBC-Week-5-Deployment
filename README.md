@@ -1,34 +1,25 @@
-# SequenceLab — Deployment LSTM & GRU (Week 5)
+# Runtun: deploy LSTM/GRU (MBC LAS Week 5)
 
-Akmal Nugraha Saputra · CaAs 2609 · NIM 103052500014
+Akmal Nugraha Saputra (2609). Deploy dua model terbaik dari Week 3:
 
-Dua model terbaik dari Tugas Week 3 dideploy ke Streamlit:
+- Prakiraan suhu Jena Climate: `LSTM_A_seq72.h5` (MAE 0,4772 °C)
+- Sentimen ulasan IMDB: `GRU_A_seq400.h5` (akurasi 89,35%, F1 0,8949)
 
-| Model | Tugas | File | Skor uji |
-|---|---|---|---|
-| LSTM (1 layer 64 unit, seq 72) | Prediksi suhu 1 jam ke depan, Jena Climate | `models/LSTM_A_seq72.h5` | MAE 0,4772 °C |
-| GRU (1 layer 64 unit, seq 400) | Sentimen ulasan film, IMDB 50K | `models/GRU_A_seq400.h5` | Accuracy 0,8935 |
+## Struktur
 
-## Langkah deploy (urut)
-
-1. **Ekspor artefak dari Colab.** Buka notebook Week 3 (semua sel sudah dijalankan), tempel isi
-   `export_artefak_colab.py` ke sel baru, jalankan. Hasilnya di Drive: folder `deploy_artefak/`
-   berisi 2 file `.h5`, `scaler.json`, `tokenizer.json`, `sample_jena.csv`.
-2. **Buat repo GitHub** dengan struktur:
-   ```
-   app.py
-   requirements.txt
-   .streamlit/config.toml
-   models/  (isi dari deploy_artefak/)
-   screenshot/
-   ```
-3. **Deploy v1 dulu** untuk dokumentasi versioning: di repo, ganti `app.py` dengan isi `app_v1.py`
-   (atau buat branch `v1`), deploy di share.streamlit.io, screenshot, catat link.
-4. **Deploy v2** (file `app.py` di folder ini), screenshot, catat link.
-5. Isi tabel versioning (`versioning.csv` sudah disiapkan, tinggal ganti kolom Link).
-
-Di Streamlit Cloud pilih Python 3.11 atau 3.12 di Advanced settings. Model `.h5` ukurannya
-kecil (< 6 MB), jadi aman langsung di-commit tanpa Git LFS.
+```
+app.py                  aplikasi final (v2): beranda, prakiraan suhu, pembaca ulasan, tentang model
+.streamlit/config.toml  tema warna dan font
+requirements.txt
+models/                 LSTM_A_seq72.h5, GRU_A_seq400.h5, scaler.json, tokenizer.json,
+                        sample_jena.csv, (opsional) sample_ulasan.csv, model pembanding lain
+jena/v1/app.py          versi 1 prakiraan suhu
+jena/v2/app.py          versi 2 prakiraan suhu (halaman suhu dari app.py)
+imdb/v1/app.py          versi 1 sentimen
+imdb/v2/app.py          versi 2 sentimen (halaman ulasan dari app.py)
+colab_export_artefak.py cadangan untuk membuat ulang scaler/tokenizer/sampel di Colab
+versioning.csv          tabel versioning (juga tampil di halaman Tentang model)
+```
 
 ## Menjalankan lokal
 
@@ -37,9 +28,14 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Fitur v2 (nilai bonus)
-- `st.cache_resource`: model dan tokenizer hanya dimuat sekali per server, klik berikutnya instan.
-- Tokenisasi ditulis ulang dengan numpy murni (tanpa `keras.preprocessing`), lebih ringan dan
-  tidak tergantung versi Keras.
-- Data contoh bawaan + slider jendela waktu, jadi pengguna bisa langsung membandingkan prediksi
-  dengan nilai aktual tanpa mengunggah apa pun.
+## Deploy di Streamlit Community Cloud
+
+Buat app baru dari repo ini, pilih Python 3.12, lalu isi *Main file path* sesuai link yang ingin dibuat:
+`jena/v1/app.py`, `imdb/v1/app.py`, `jena/v2/app.py`, `imdb/v2/app.py`, atau `app.py` (gabungan).
+
+## Optimasi
+
+- Model dan data dimuat sekali lalu disimpan di cache (`st.cache_resource`, `st.cache_data`).
+- TensorFlow baru diimpor saat halaman model dibuka.
+- Mode "TFLite ringan": model .h5 dikonversi otomatis ke TFLite dengan dynamic-range quantization
+  (bobot int8), sekitar 4x lebih kecil dan jauh lebih cepat untuk satu prediksi.
