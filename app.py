@@ -24,7 +24,7 @@ import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT / "models"
-APP_VERSION = "v2.0"
+APP_VERSION = "v3.0"
 
 # ---------------------------------------------------------------------------
 # Token desain
@@ -508,15 +508,6 @@ def missing_box(what: str, files: str) -> None:
     )
 
 
-def engine_picker(key: str) -> str:
-    choice = st.segmented_control(
-        "Mesin prediksi", ["Keras (.h5)", "TFLite ringan"], default="Keras (.h5)", key=key,
-        help="TFLite ringan memakai model yang dikuantisasi ke int8: ukurannya sekitar 4 kali lebih kecil "
-             "dan biasanya lebih cepat untuk satu prediksi. Hasilnya hampir sama dengan Keras.",
-    )
-    return "keras" if choice == "Keras (.h5)" else "tflite"
-
-
 # ---------------------------------------------------------------------------
 # Halaman: Beranda
 # ---------------------------------------------------------------------------
@@ -597,19 +588,12 @@ def page_forecast() -> None:
         missing_box("Prakiraan suhu", "`LSTM_A_seq72.h5` (atau model Jena lain) dan `scaler.json`")
         return
 
-    with st.container(border=True):
-        a, b, c = st.columns([1.4, 1.2, 1], gap="medium")
-        with a:
-            labels = {model_label(d): d for d in models}
-            chosen = labels[st.selectbox("Model", list(labels), help="Urutan teratas adalah model dengan galat terkecil di notebook.")]
-        with b:
-            source = st.radio("Sumber data", ["Data uji Jena", "Unggah CSV"], horizontal=True,
-                              help="Data uji Jena adalah periode Okt 2015 sampai Des 2016 yang tidak dipakai saat training.")
-        with c:
-            engine = engine_picker("eng_jena")
+    chosen, engine = models[0], "keras"  # model terbaik (MAE terkecil di notebook)
+    source = st.radio("Sumber data", ["Data cuaca Jena 2015–2016", "Unggah data sendiri (CSV)"], horizontal=True,
+                      help="Data cuaca Jena adalah catatan asli Okt 2015 sampai Des 2016 yang tidak dipakai saat melatih model.")
 
     df = None
-    if source == "Unggah CSV":
+    if source.startswith("Unggah"):
         up = st.file_uploader("Unggah CSV dengan kolom seperti dataset Jena Climate (termasuk `Date Time`)",
                               type="csv", help="Data per 10 menit otomatis diubah menjadi per jam, sama seperti di notebook.")
         if up is None:
@@ -641,13 +625,8 @@ def page_forecast() -> None:
     temps = df[TARGET].to_numpy(float)
     times = df.index
 
-    tab1, tab2 = st.tabs(["Satu jam tertentu", "Uji rentang waktu"])
-    ctx = dict(models=models, chosen=chosen, engine=engine, scaled=scaled, temps=temps, times=times,
-               t_mean=t_mean, t_std=t_std, seq=seq)
-    with tab1:
-        forecast_single(**ctx)
-    with tab2:
-        forecast_range(**ctx)
+    forecast_single(models=models, chosen=chosen, engine=engine, scaled=scaled, temps=temps, times=times,
+                    t_mean=t_mean, t_std=t_std, seq=seq)
 
 
 def forecast_single(models, chosen, engine, scaled, temps, times, t_mean, t_std, seq) -> None:
@@ -715,70 +694,6 @@ def forecast_single(models, chosen, engine, scaled, temps, times, t_mean, t_std,
                      + ([("Suhu sebenarnya", COLD, "diamond")] if actual is not None else []))
         st.altair_chart((base + dots).properties(height=300), width="stretch")
 
-    # garis warna 72 jam (konteks cepat)
-    st.markdown(stripes_html(temps[pos - seq:pos], -10, 30, small=True), unsafe_allow_html=True)
-    st.markdown(f'<div class="stripe-legend"><span>{times[pos - seq]:%d/%m %H.00}</span>'
-                f'<span>suhu per jam yang dibaca model</span><span>{times[pos - 1]:%d/%m %H.00}</span></div>',
-                unsafe_allow_html=True)
-
-
-def forecast_range(models, chosen, engine, scaled, temps, times, t_mean, t_std, seq) -> None:
-    st.markdown("Model menebak setiap jam dalam rentang yang kamu pilih, lalu hasilnya dibandingkan "
-                "dengan suhu yang benar-benar tercatat.")
-    r1, r2, r3 = st.columns([1, 1, 1.2])
-    max_seq = max(d["seq"] for d in models)
-    valid_start, valid_end = times[max_seq], times[-1]
-    with r1:
-        start_day = st.date_input("Mulai", value=max(valid_start, pd.Timestamp("2016-07-01")).date()
-                                  if valid_end >= pd.Timestamp("2016-07-01") else valid_start.date(),
-                                  min_value=valid_start.date(), max_value=valid_end.date(), format="DD/MM/YYYY", key="rs")
-    with r2:
-        days = st.slider("Panjang (hari)", 1, 14, 7)
-    with r3:
-        compare = st.checkbox("Bandingkan semua model yang tersedia", value=len(models) > 1,
-                              disabled=len(models) < 2,
-                              help="Aktif jika ada lebih dari satu model Jena di folder models/.")
-    run = st.button("Jalankan uji rentang", type="primary")
-    if run:
-        s = max(int(times.searchsorted(pd.Timestamp(start_day))), max_seq)
-        e = min(s + days * 24, len(times))
-        idx = np.arange(s, e)
-        chosen_list = models if compare else [chosen]
-        frames, rows = [pd.DataFrame({"waktu": times[idx], "suhu": temps[idx], "seri": "Suhu sebenarnya"})], []
-        prog = st.progress(0.0, text="Menyiapkan jendela data...")
-        for n, d in enumerate(chosen_list):
-            X = np.stack([scaled[i - d["seq"]:i] for i in idx])
-            p, ms = run_model(str(d["path"]), X, engine)
-            p = p * t_std + t_mean
-            err = p - temps[idx]
-            rows.append({"Model": model_label(d), "MAE (°C)": np.abs(err).mean(),
-                         "RMSE (°C)": np.sqrt((err ** 2).mean()), "Waktu per tebakan (ms)": ms})
-            frames.append(pd.DataFrame({"waktu": times[idx], "suhu": p, "seri": model_label(d)}))
-            prog.progress((n + 1) / len(chosen_list), text=f"Selesai: {model_label(d)}")
-        prog.empty()
-        res = pd.DataFrame(rows).sort_values("MAE (°C)")
-        best = res.iloc[0]
-        reading("Rata-rata meleset dalam rentang ini", f"±{best['MAE (°C)']:.2f} °C",
-                f"{best['Model']} pada {len(idx)} jam, {times[idx[0]]:%d/%m/%Y} sampai {times[idx[-1]]:%d/%m/%Y}.",
-                COLD, [("RMSE", f"{best['RMSE (°C)']:.2f} °C"), ("jam diuji", f"{len(idx)}"),
-                       ("waktu per tebakan", f"{best['Waktu per tebakan (ms)']:.2f} ms")])
-        st.write("")
-        plot = pd.concat(frames)
-        series = list(plot["seri"].unique())
-        palette = [INK, WARM, COLD, "#E0A21B", "#3F8F6B", "#7A5AC8"][: len(series)]
-        chart = alt.Chart(plot).mark_line(strokeWidth=1.8).encode(
-            x=alt.X("waktu:T", title=None, axis=alt.Axis(format="%d/%m", labelAngle=0, tickCount="day")),
-            y=alt.Y("suhu:Q", title="Suhu (°C)", scale=alt.Scale(zero=False)),
-            color=alt.Color("seri:N", legend=None, scale=alt.Scale(domain=series, range=palette)),
-            strokeDash=alt.condition(alt.datum.seri == "Suhu sebenarnya", alt.value([1, 0]), alt.value([5, 3])),
-            tooltip=["seri:N", alt.Tooltip("waktu:T", format="%d/%m %H.00"), alt.Tooltip("suhu:Q", format=".2f")])
-        legend_chips([(ser, col, "line" if ser == "Suhu sebenarnya" else "dash") for ser, col in zip(series, palette)])
-        st.altair_chart(chart.properties(height=340).interactive(bind_y=False), width="stretch")
-        st.dataframe(res.style.format({"MAE (°C)": "{:.3f}", "RMSE (°C)": "{:.3f}", "Waktu per tebakan (ms)": "{:.2f}"}),
-                     hide_index=True, width="stretch")
-        out = plot.pivot_table(index="waktu", columns="seri", values="suhu").reset_index()
-        st.download_button("Unduh hasil (CSV)", out.to_csv(index=False).encode(), "prakiraan_suhu.csv", "text/csv")
-
 
 # ---------------------------------------------------------------------------
 # Halaman: Pembaca ulasan
@@ -801,13 +716,7 @@ def page_sentiment() -> None:
         missing_box("Pembaca ulasan", "`GRU_A_seq400.h5` (atau model IMDB lain) dan `tokenizer.json`")
         return
 
-    with st.container(border=True):
-        a, c = st.columns([2, 1], gap="medium")
-        with a:
-            labels = {model_label(d): d for d in models}
-            chosen = labels[st.selectbox("Model", list(labels), key="imdb_model")]
-        with c:
-            engine = engine_picker("eng_imdb")
+    chosen, engine = models[0], "keras"  # model terbaik (F1 tertinggi di notebook)
     L = chosen["seq"]
 
     tab1, tab2 = st.tabs(["Satu ulasan", "Banyak ulasan sekaligus"])
