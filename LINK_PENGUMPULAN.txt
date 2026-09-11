@@ -1,0 +1,26 @@
+Nama : Akmal Nugraha Saputra
+Kode : 2609
+NIM  : 103052500014
+
+Model yang di-deploy (terbaik dari Week 3):
+1. Prakiraan Suhu Jena Climate - LSTM (MAE 0,4772 °C) -> models/LSTM_A_seq72.h5
+2. Sentimen Ulasan IMDB - GRU (Akurasi 89,35%)       -> models/GRU_A_seq400.h5
+
+Link aplikasi Streamlit:
+- Suhu v1         : https://akmal-suhu-v1.streamlit.app/
+- Sentimen v1     : https://akmaln-sentimen-v1.streamlit.app/
+- Suhu v2 / v3    : https://akmal-suhu-v2.streamlit.app/
+- Sentimen v2 / v3: https://mbc-week-5-deployment-imdbv2.streamlit.app/
+
+Repository GitHub:
+https://github.com/akmal234dcn/MBC-Week-5-Deployment
+
+Tabel versioning (Google Sheet):
+[https://docs.google.com/spreadsheets/d/13-5woakBRwEsYSzQX0kLeN_2kPHPHNwAH7jDlIYP5pw/edit?usp=sharing]
+
+Kode sumber di dalam ZIP ini:
+- app.py (aplikasi utama), jena/ dan imdb/ (v1 dan v2 per model)
+- requirements.txt
+- models/ (file .h5, scaler.json, tokenizer.json, sample_jena.csv)
+- screenshot/ (dokumentasi v1, v2, v3)
+- versioning.csv
