@@ -1,765 +1,1038 @@
 """
-SequenceLab — Deployment Model LSTM & GRU (Week 3 Big Data)
-Versi 2 (final)
+Runtun: aplikasi deploy model sekuensial (LSTM/GRU) - Tugas MBC LAS Week 5
+Akmal Nugraha Saputra (2609)
 
-Model yang dideploy:
-  1. LSTM (1 layer, 64 unit, seq 72 jam) -> prediksi suhu 1 jam ke depan, Jena Climate
-  2. GRU  (1 layer, 64 unit, seq 400 token) -> klasifikasi sentimen ulasan film, IMDB 50K
+Model yang dipakai (hasil terbaik Week 3):
+  1. Prakiraan suhu Jena Climate  -> models/LSTM_A_seq72.h5 (atau model *_seq72 / *_seq24 lain)
+  2. Sentimen ulasan film IMDB    -> models/GRU_A_seq400.h5 (atau model *_seq200 / *_seq400 lain)
 
-Nama : AKMAL NUGRAHA SAPUTRA | Kode CaAs : 2609 | NIM : 103052500014
+Artefak pendukung di folder models/:
+  scaler.json, tokenizer.json, sample_jena.csv, (opsional) sample_ulasan.csv
 """
+from __future__ import annotations
 
+import html
 import json
-import os
 import re
+import time
+from pathlib import Path
 
+import altair as alt
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-# --------------------------------------------------------------------------- #
-# Konstanta
-# --------------------------------------------------------------------------- #
+ROOT = Path(__file__).resolve().parent
+MODEL_DIR = ROOT / "models"
 APP_VERSION = "v2.0"
-MODEL_DIR = "models"
 
-TEMP_MODEL_PATH = os.path.join(MODEL_DIR, "LSTM_A_seq72.h5")
-SCALER_PATH = os.path.join(MODEL_DIR, "scaler.json")
-SAMPLE_JENA_PATH = os.path.join(MODEL_DIR, "sample_jena.csv")
+# ---------------------------------------------------------------------------
+# Token desain
+# ---------------------------------------------------------------------------
+INK = "#172033"
+MUTED = "#586179"
+PAPER = "#EEF1F5"
+SURFACE = "#FFFFFF"
+LINE = "#D6DCE6"
+COLD = "#2C4FB8"
+WARM = "#C8283E"
 
-SENT_MODEL_PATH = os.path.join(MODEL_DIR, "GRU_A_seq400.h5")
-TOKENIZER_PATH = os.path.join(MODEL_DIR, "tokenizer.json")
+# Skala divergen dingin -> hangat (dipakai untuk suhu DAN sentimen)
+THERMAL = ["#14306E", "#2C4FB8", "#6E8FDB", "#B8C8EE", "#EDEAE4",
+           "#F4B9AB", "#E0705C", "#C8283E", "#7F1128"]
 
-SEQ_LEN_TEMP = 72
-SEQ_LEN_TEXT = 400
-VOCAB_SIZE = 20000
-OOV_INDEX = 1
-
-FEATURES = [
+JENA_FEATURES_DEFAULT = [
     "p (mbar)", "T (degC)", "Tdew (degC)", "rh (%)", "VPmax (mbar)",
     "VPact (mbar)", "VPdef (mbar)", "sh (g/kg)", "H2OC (mmol/mol)",
     "rho (g/m**3)", "wv (m/s)", "max. wv (m/s)", "wd (deg)",
 ]
 TARGET = "T (degC)"
-TARGET_IDX = FEATURES.index(TARGET)
 
-CONTOH_ULASAN = {
-    "Ulasan positif": (
-        "One of the best films I have seen this year. The story is gripping, the "
-        "acting is superb and the soundtrack fits every scene perfectly. I was on "
-        "the edge of my seat until the very end and would happily watch it again."
-    ),
-    "Ulasan negatif": (
-        "What a waste of two hours. The plot made no sense, the dialogue was "
-        "painfully cheesy and the ending felt rushed. Even the lead actor looked "
-        "bored. I honestly cannot recommend this to anyone."
-    ),
-    "Ulasan campuran": (
-        "The visuals were stunning and the cast clearly gave their best, but the "
-        "script let everyone down. Some scenes dragged on forever and the humour "
-        "rarely landed. Not terrible, just disappointing considering the budget."
-    ),
+# Hasil evaluasi test set dari notebook Week 3 (dipakai untuk kartu model)
+JENA_METRICS = {
+    ("LSTM", "A", 24): (0.4981, 0.7178), ("GRU", "A", 24): (0.4804, 0.6871),
+    ("LSTM", "B", 24): (0.5127, 0.7269), ("GRU", "B", 24): (0.5102, 0.7170),
+    ("LSTM", "A", 72): (0.4772, 0.6685), ("GRU", "A", 72): (0.4782, 0.6738),
+    ("LSTM", "B", 72): (0.4989, 0.7029), ("GRU", "B", 72): (0.5063, 0.7090),
+}
+IMDB_METRICS = {  # accuracy, precision, recall, f1
+    ("LSTM", "A", 200): (0.8735, 0.8522, 0.9049, 0.8777),
+    ("GRU", "A", 200): (0.8736, 0.8885, 0.8556, 0.8717),
+    ("LSTM", "B", 200): (0.8754, 0.8661, 0.8891, 0.8775),
+    ("GRU", "B", 200): (0.8720, 0.9093, 0.8275, 0.8665),
+    ("LSTM", "A", 400): (0.8686, 0.8489, 0.8982, 0.8728),
+    ("GRU", "A", 400): (0.8935, 0.8865, 0.9036, 0.8949),
+    ("LSTM", "B", 400): (0.8766, 0.8649, 0.8937, 0.8791),
+    ("GRU", "B", 400): (0.8834, 0.8558, 0.9234, 0.8883),
+}
+PARAMS = {
+    ("jena", "LSTM", "A"): 20033, ("jena", "GRU", "A"): 15233,
+    ("jena", "LSTM", "B"): 32417, ("jena", "GRU", "B"): 24609,
+    ("imdb", "LSTM", "A"): 1313089, ("imdb", "GRU", "A"): 1305025,
+    ("imdb", "LSTM", "B"): 1325473, ("imdb", "GRU", "B"): 1314401,
+}
+CONFIG_TEXT = {"A": "1 layer, 64 unit", "B": "2 layer (64 dan 32 unit) + dropout"}
+
+EXAMPLES = {
+    "Hangat": ("I went in with low expectations and walked out grinning. The cast has "
+               "real chemistry, the jokes land, and the final twenty minutes are "
+               "genuinely moving. I would happily watch it again with friends."),
+    "Dingin": ("Two hours I will never get back. The plot makes no sense, the dialogue "
+               "is wooden, and even the talented lead cannot save a script this lazy. "
+               "Skip it."),
+    "Campur": ("The actors were great and the soundtrack is lovely, but the story drags "
+               "so badly that I kept checking my watch. What a waste of a good cast."),
+    "Negasi": "Not good. Not funny. Not worth your time or your money.",
 }
 
-# --------------------------------------------------------------------------- #
-# Tampilan
-# --------------------------------------------------------------------------- #
-st.set_page_config(
-    page_title="SequenceLab · LSTM & GRU",
-    page_icon="🌡️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
-CSS = """
+# ---------------------------------------------------------------------------
+# Gaya
+# ---------------------------------------------------------------------------
+def inject_css() -> None:
+    st.markdown(
+        f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&display=swap');
 
-html, body, [class*="css"], .stMarkdown, .stText, p, li, label, input, textarea {
-    font-family: 'IBM Plex Sans', system-ui, sans-serif;
-}
-h1, h2, h3, h4 { font-family: 'Sora', system-ui, sans-serif; letter-spacing: -0.01em; }
+.stMarkdown p, .stMarkdown li, textarea, input {{
+  font-family: 'Atkinson Hyperlegible', system-ui, sans-serif;
+}}
+h1, h2, h3, h4 {{
+  font-family: 'Bricolage Grotesque', 'Atkinson Hyperlegible', sans-serif !important;
+  color: {INK};
+  letter-spacing: -0.015em;
+}}
+.block-container {{ max-width: 1120px; padding-top: 4.5rem; padding-bottom: 4rem; }}
+p, li {{ line-height: 1.6; }}
 
-/* sidebar gelap */
-[data-testid="stSidebar"] {
-    background: #0F1B2D;
-    border-right: 1px solid #1D2B45;
-}
-[data-testid="stSidebar"] * { color: #E4E9F2 !important; }
-[data-testid="stSidebar"] .stRadio label { padding: 4px 0; }
-[data-testid="stSidebar"] hr { border-color: #24354F; }
+/* Hero */
+.stMarkdown .hero-title {{
+  font-family: 'Bricolage Grotesque', sans-serif !important; font-weight: 800 !important;
+  font-size: clamp(3.4rem, 10vw, 7rem) !important; line-height: 1 !important; margin: 0 0 .6rem -0.04em !important;
+  letter-spacing: -0.04em; color: {INK}; padding: 0 !important;
+}}
+.stMarkdown .hero-lede {{ font-size: 1.25rem; color: {INK}; max-width: 38ch; margin: 0 0 1.6rem 0; }}
+.hero-note {{ color: {MUTED}; font-size: .95rem; max-width: 60ch; }}
 
-.block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1180px; }
+/* Garis suhu (warming stripes) */
+.stripes {{ display: flex; height: 112px; width: 100%; border-radius: 3px; overflow: hidden; }}
+.stripes span {{ flex: 1 1 0; }}
+.stripes.small {{ height: 18px; }}
+.stripe-legend {{ display: flex; justify-content: space-between; color: {MUTED};
+  font-size: .85rem; margin-top: .45rem; }}
 
-/* hero */
-.hero {
-    display: flex; align-items: flex-end; justify-content: space-between; gap: 24px;
-    padding: 28px 32px; border-radius: 18px;
-    background: linear-gradient(120deg, #0F1B2D 0%, #1C3A6B 55%, #2F5BEA 100%);
-    color: #F4F6FA; margin-bottom: 22px;
-}
-.hero h1 { font-size: 2.1rem; margin: 0 0 8px 0; color: #FFFFFF; }
-.hero p  { margin: 0; color: #C9D4EA; max-width: 640px; line-height: 1.55; }
-.hero .tag {
-    font-family: 'Sora', sans-serif; font-size: 0.8rem; padding: 6px 12px; border-radius: 999px;
-    background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.25);
-    white-space: nowrap;
-}
+/* Panel hasil ("bacaan") */
+.reading {{ background: {SURFACE}; border: 1px solid {LINE}; border-left: 8px solid var(--tone, {COLD});
+  border-radius: 6px; padding: 1.25rem 1.5rem; }}
+.reading .label {{ color: {MUTED}; font-size: .95rem; margin: 0; }}
+.reading .value {{ font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800;
+  font-size: clamp(2.6rem, 6vw, 3.6rem); line-height: 1.05; color: {INK}; margin: .15rem 0 .35rem 0; }}
+.reading .sub {{ color: {INK}; margin: 0; }}
+.facts {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: .75rem 1.5rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid {LINE}; }}
+.facts div b {{ display: block; font-family: 'Bricolage Grotesque', sans-serif;
+  font-size: 1.35rem; color: {INK}; }}
+.facts div span {{ color: {MUTED}; font-size: .9rem; }}
 
-/* kartu */
-.card {
-    background: #FFFFFF; border: 1px solid #E3E8F0; border-radius: 16px;
-    padding: 22px 24px; height: 100%;
-}
-.card h3 { margin: 0 0 6px 0; font-size: 1.15rem; }
-.card .sub { color: #5B6778; margin: 0 0 14px 0; font-size: 0.93rem; }
-.card.warm { border-top: 5px solid #FF7A45; }
-.card.cool { border-top: 5px solid #17A2A0; }
+/* Termometer sentimen */
+.gauge {{ position: relative; height: 16px; border-radius: 999px; margin: 1.1rem 0 .4rem 0;
+  background: linear-gradient(90deg, {", ".join(THERMAL)}); }}
+.gauge .pin {{ position: absolute; top: -7px; width: 6px; height: 30px; border-radius: 3px;
+  background: {INK}; box-shadow: 0 0 0 3px {SURFACE}; transform: translateX(-3px); }}
+.gauge-legend {{ display: flex; justify-content: space-between; color: {MUTED}; font-size: .85rem; }}
 
-.metric-row { display: flex; gap: 12px; flex-wrap: wrap; }
-.metric {
-    flex: 1 1 120px; background: #F4F6FA; border-radius: 12px; padding: 12px 14px;
-}
-.metric .v { font-family: 'Sora', 'IBM Plex Sans', sans-serif; font-size: 1.35rem; font-weight: 600; color: #172033; }
-.metric .l { font-size: 0.78rem; color: #5B6778; }
+/* Teks dengan sorotan kata */
+.marked {{ background: {SURFACE}; border: 1px solid {LINE}; border-radius: 6px;
+  padding: 1rem 1.2rem; line-height: 2.05; font-size: 1.02rem; max-height: 340px; overflow-y: auto; }}
+.marked span {{ padding: .12rem .22rem; border-radius: 3px; }}
 
-/* hasil */
-.result {
-    border-radius: 16px; padding: 22px 26px; margin: 8px 0 16px 0; color: #FFFFFF;
-}
-.result .big { font-family: 'Sora', 'IBM Plex Sans', sans-serif; font-size: 2.6rem; font-weight: 700; line-height: 1.1; }
-.result .lbl { opacity: 0.85; font-size: 0.95rem; }
-.result.temp { background: linear-gradient(120deg, #FF7A45, #FF4D6D); }
-.result.pos  { background: linear-gradient(120deg, #17A2A0, #2ECC8A); }
-.result.neg  { background: linear-gradient(120deg, #E0475B, #B0306E); }
-.result.mid  { background: linear-gradient(120deg, #6B7A90, #4A5568); }
+/* Entri beranda */
+.entry h3 {{ margin-top: .2rem; }}
+.entry .num {{ font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800;
+  font-size: 2.4rem; color: {INK}; line-height: 1; }}
+.entry .num-label {{ color: {MUTED}; font-size: .92rem; }}
+.steps {{ counter-reset: s; list-style: none; padding: 0; margin: 0; }}
+.steps li {{ counter-increment: s; position: relative; padding: 0 0 .9rem 2.6rem; }}
+.steps li::before {{ content: counter(s); position: absolute; left: 0; top: -.1rem;
+  width: 1.8rem; height: 1.8rem; border-radius: 50%; background: {INK}; color: {SURFACE};
+  font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700; display: grid; place-items: center; }}
 
-.steps { counter-reset: s; padding-left: 0; list-style: none; }
-.steps li { counter-increment: s; position: relative; padding-left: 38px; margin: 10px 0; line-height: 1.5; }
-.steps li::before {
-    content: counter(s); position: absolute; left: 0; top: 1px;
-    width: 26px; height: 26px; border-radius: 50%; background: #2F5BEA; color: white;
-    font-family: 'Sora', sans-serif; font-size: 0.8rem; font-weight: 600;
-    display: flex; align-items: center; justify-content: center;
-}
-.note { background: #FFF6EC; border: 1px solid #FFD9B8; border-radius: 12px; padding: 12px 16px; color: #7A3E00; }
-.footer { color: #8A94A6; font-size: 0.85rem; margin-top: 40px; text-align: center; }
+.quiet, .stMarkdown p.quiet, .stMarkdown .quiet {{ color: {MUTED}; font-size: .95rem; }}
+.pill {{ display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .85rem;
+  border: 1px solid {LINE}; background: {SURFACE}; color: {INK}; }}
 
-div.stButton > button[kind="primary"] {
-    background: #2F5BEA; border: none; border-radius: 10px; padding: 10px 22px;
-    font-family: 'Sora', sans-serif; font-weight: 600;
-}
-div.stButton > button[kind="primary"]:hover { background: #1F45C8; }
-div.stButton > button { border-radius: 10px; }
+/* Fokus keyboard yang jelas */
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible,
+[role="tab"]:focus-visible, [role="radio"]:focus-visible {{
+  outline: 3px solid {COLD} !important; outline-offset: 2px;
+}}
+@media (prefers-reduced-motion: reduce) {{ * {{ transition: none !important; animation: none !important; }} }}
 </style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
+""",
+        unsafe_allow_html=True,
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Pemuatan artefak (di-cache supaya hanya dimuat sekali per server)
-# --------------------------------------------------------------------------- #
-@st.cache_resource(show_spinner="Memuat model…")
-def load_keras_model(path: str):
-    import tensorflow as tf
+def thermal_color(x: float, lo: float, hi: float) -> str:
+    """Warna dari skala dingin-hangat untuk nilai x di rentang [lo, hi]."""
+    t = 0.0 if hi == lo else float(np.clip((x - lo) / (hi - lo), 0, 1))
+    pos = t * (len(THERMAL) - 1)
+    i = int(np.floor(pos))
+    j = min(i + 1, len(THERMAL) - 1)
+    f = pos - i
+    a = np.array([int(THERMAL[i][k:k + 2], 16) for k in (1, 3, 5)])
+    b = np.array([int(THERMAL[j][k:k + 2], 16) for k in (1, 3, 5)])
+    c = (a + (b - a) * f).round().astype(int)
+    return "#%02x%02x%02x" % tuple(c)
+
+
+HARI = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus",
+         "September", "Oktober", "November", "Desember"]
+
+
+def tanggal_id(t: pd.Timestamp) -> str:
+    return f"{HARI[t.weekday()]}, {t.day} {BULAN[t.month - 1]} {t.year} pukul {t.hour:02d}.00"
+
+
+def tgl_pendek(t: pd.Timestamp) -> str:
+    return f"{t.day} {BULAN[t.month - 1][:3]} {t.year}"
+
+
+def temp_color(t_c: float) -> str:
+    return thermal_color(t_c, -10, 30)
+
+
+def stripes_html(values, lo, hi, small=False) -> str:
+    spans = "".join(f'<span style="background:{thermal_color(v, lo, hi)}"></span>' for v in values)
+    cls = "stripes small" if small else "stripes"
+    return f'<div class="{cls}" role="img" aria-label="Garis warna suhu harian">{spans}</div>'
+
+
+def altair_theme():
+    return {
+        "config": {
+            "font": "Atkinson Hyperlegible, system-ui, sans-serif",
+            "background": "transparent",
+            "view": {"stroke": None},
+            "axis": {"labelColor": MUTED, "titleColor": MUTED, "gridColor": "#E3E7EE",
+                     "domainColor": LINE, "tickColor": LINE, "labelFontSize": 12,
+                     "titleFontSize": 12, "titleFontWeight": "normal"},
+            "legend": {"labelColor": INK, "titleColor": MUTED, "orient": "top",
+                       "labelFontSize": 12, "titleFontSize": 12},
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pencarian model dan artefak
+# ---------------------------------------------------------------------------
+NAME_RE = re.compile(r"(LSTM|GRU)_([AB])_seq(\d+)", re.I)
+
+
+def describe_model(path: Path) -> dict:
+    m = NAME_RE.search(path.stem)
+    if not m:
+        return {"path": path, "cell": path.stem, "cfg": "?", "seq": None, "task": None}
+    cell, cfg, seq = m.group(1).upper(), m.group(2).upper(), int(m.group(3))
+    task = "jena" if seq <= 168 else "imdb"
+    return {"path": path, "cell": cell, "cfg": cfg, "seq": seq, "task": task}
+
+
+def model_label(d: dict) -> str:
+    unit = "jam" if d["task"] == "jena" else "kata"
+    return f'{d["cell"]} {CONFIG_TEXT.get(d["cfg"], "")}, {d["seq"]} {unit}'
+
+
+@st.cache_data(show_spinner=False)
+def find_models() -> dict:
+    out = {"jena": [], "imdb": []}
+    if MODEL_DIR.exists():
+        for p in sorted(MODEL_DIR.rglob("*.h5")):
+            d = describe_model(p)
+            if d["task"]:
+                out[d["task"]].append(d)
+
+    def rank(d):  # model terbaik menurut notebook ditaruh paling depan
+        if d["task"] == "jena":
+            return JENA_METRICS.get((d["cell"], d["cfg"], d["seq"]), (9, 9))[0]
+        return -IMDB_METRICS.get((d["cell"], d["cfg"], d["seq"]), (0, 0, 0, 0))[3]
+
+    for k in out:
+        out[k].sort(key=rank)
+    return out
+
+
+def find_file(*names: str) -> Path | None:
+    for n in names:
+        for base in (MODEL_DIR, ROOT, ROOT / "jena", ROOT / "imdb",
+                     ROOT / "jena" / "models", ROOT / "imdb" / "models"):
+            p = base / n
+            if p.exists():
+                return p
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_tf():
+    import os
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    import tensorflow as tf  # impor lambat: halaman beranda tidak perlu menunggu TensorFlow
+    return tf
+
+
+@st.cache_resource(show_spinner=False)
+def load_keras(path: str):
+    tf = get_tf()
     return tf.keras.models.load_model(path, compile=False)
 
 
-@st.cache_resource
-def load_scaler(path: str):
-    with open(path) as f:
-        sc = json.load(f)
-    return np.array(sc["mean"], dtype=np.float32), np.array(sc["scale"], dtype=np.float32)
+@st.cache_resource(show_spinner=False)
+def build_tflite(path: str) -> bytes:
+    """Optimasi: konversi .h5 ke TFLite dengan dynamic-range quantization (bobot int8).
+    Jika sudah ada file .tflite di samping .h5, file itu yang dipakai."""
+    ready = Path(path).with_suffix(".tflite")
+    if ready.exists():
+        return ready.read_bytes()
+    tf = get_tf()
+    model = load_keras(path)
+    shape = [1] + [int(s) for s in model.input_shape[1:]]
+    dtype = tf.int32 if len(shape) == 2 else tf.float32
+
+    @tf.function(input_signature=[tf.TensorSpec(shape, dtype)])
+    def serve(x):
+        return model(x, training=False)
+
+    conv = tf.lite.TFLiteConverter.from_concrete_functions([serve.get_concrete_function()], model)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    try:
+        return conv.convert()
+    except Exception:
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS]
+        return conv.convert()
 
 
-@st.cache_resource
-def load_word_index(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    # format keluaran tokenizer.to_json() dari Keras
-    if isinstance(data, dict) and "config" in data:
-        wi = data["config"]["word_index"]
-        return json.loads(wi) if isinstance(wi, str) else wi
-    return data  # sudah berupa {kata: indeks}
+def run_model(path: str, X: np.ndarray, engine: str) -> tuple[np.ndarray, float]:
+    """Mengembalikan (prediksi, milidetik per sampel)."""
+    t0 = time.perf_counter()
+    if engine == "tflite":
+        tf = get_tf()
+        interp = tf.lite.Interpreter(model_content=build_tflite(path))
+        interp.allocate_tensors()
+        inp, outp = interp.get_input_details()[0], interp.get_output_details()[0]
+        preds = np.empty(len(X), dtype=np.float32)
+        t0 = time.perf_counter()
+        for k in range(len(X)):
+            interp.set_tensor(inp["index"], X[k:k + 1].astype(inp["dtype"]))
+            interp.invoke()
+            preds[k] = interp.get_tensor(outp["index"]).ravel()[0]
+    else:
+        model = load_keras(path)
+        t0 = time.perf_counter()
+        parts = [model(X[i:i + 256], training=False).numpy().ravel() for i in range(0, len(X), 256)]
+        preds = np.concatenate(parts) if parts else np.array([])
+    ms = (time.perf_counter() - t0) * 1000 / max(len(X), 1)
+    return preds, ms
 
 
-@st.cache_data
-def load_sample_jena(path: str) -> pd.DataFrame:
-    return pd.read_csv(path)
+# ---------------------------------------------------------------------------
+# Data Jena
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_scaler() -> dict | None:
+    p = find_file("scaler.json", "scaler_jena.json", "jena_scaler.json")
+    if p is None:
+        return None
+    raw = json.loads(p.read_text())
+
+    def pick(*keys):
+        for k in keys:
+            if k in raw:
+                return raw[k]
+        return None
+
+    mean = pick("mean", "mean_", "means", "feature_mean")
+    scale = pick("scale", "scale_", "std", "stds", "feature_std")
+    feats = pick("features", "feature_names", "columns", "feature_cols", "feature_names_in_")
+    if mean is None or scale is None:
+        return None
+    feats = list(feats) if feats else JENA_FEATURES_DEFAULT[: len(mean)]
+    return {"features": feats, "mean": np.asarray(mean, float), "scale": np.asarray(scale, float)}
 
 
-def artefak_ada(*paths) -> bool:
-    return all(os.path.exists(p) for p in paths)
-
-
-# --------------------------------------------------------------------------- #
-# Preprocessing (identik dengan notebook Week 3)
-# --------------------------------------------------------------------------- #
-def siapkan_jena(df: pd.DataFrame) -> pd.DataFrame:
-    """Terima CSV Jena mentah (10 menit) atau data per jam; kembalikan 13 fitur per jam."""
+def prepare_hourly(df: pd.DataFrame) -> pd.DataFrame:
+    """Samakan data mentah dengan preprocessing di notebook: bersihkan -9999,
+    ubah ke per jam bila datanya per 10 menit, lalu jadikan waktu sebagai indeks."""
     df = df.copy()
-    for c in ["wv (m/s)", "max. wv (m/s)"]:
+    tcol = next((c for c in df.columns if c.strip().lower() in ("date time", "datetime", "date_time", "time", "waktu")), None)
+    if tcol is None:
+        tcol = df.columns[0]
+    t = pd.to_datetime(df[tcol], format="%d.%m.%Y %H:%M:%S", errors="coerce")
+    if t.isna().mean() > 0.5:
+        t = pd.to_datetime(df[tcol], errors="coerce")
+    df.index = t
+    df = df[~df.index.isna()].drop(columns=[tcol]).sort_index()
+    for c in ("wv (m/s)", "max. wv (m/s)"):
         if c in df.columns:
             df.loc[df[c] == -9999.0, c] = 0.0
-
-    # kalau masih 10 menitan (interval pertama < 1 jam), downsample ke per jam
-    if "Date Time" in df.columns:
-        try:
-            dt = pd.to_datetime(df["Date Time"], format="%d.%m.%Y %H:%M:%S", errors="coerce")
-            if dt.isna().all():
-                dt = pd.to_datetime(df["Date Time"], errors="coerce")
-            df["Date Time"] = dt
-            if len(dt) > 1 and (dt.iloc[1] - dt.iloc[0]) < pd.Timedelta(hours=1):
-                df = df.iloc[5::6].reset_index(drop=True)
-        except Exception:
-            pass
-
-    hilang = [c for c in FEATURES if c not in df.columns]
-    if hilang:
-        raise ValueError(f"Kolom berikut tidak ditemukan: {', '.join(hilang)}")
+    if len(df) > 3:
+        step = pd.Series(df.index).diff().median()
+        if pd.notna(step) and step < pd.Timedelta(minutes=30):
+            df = df.iloc[5::6]
     return df
 
 
-def prediksi_suhu(model, mean, scale, window: np.ndarray) -> float:
-    """window: array (72, 13) dalam satuan asli. Kembalikan suhu (°C) 1 jam berikutnya."""
-    x = (window - mean) / scale
-    y = model.predict(x[np.newaxis, ...].astype(np.float32), verbose=0).flatten()[0]
-    return float(y * scale[TARGET_IDX] + mean[TARGET_IDX])
+@st.cache_data(show_spinner=False)
+def load_jena_sample() -> pd.DataFrame | None:
+    p = find_file("sample_jena.csv", "jena_sample.csv", "sample_test_jena.csv")
+    if p is None:
+        return None
+    return prepare_hourly(pd.read_csv(p))
+
+
+@st.cache_data(show_spinner=False)
+def read_uploaded_csv(data: bytes) -> pd.DataFrame:
+    import io
+    return prepare_hourly(pd.read_csv(io.BytesIO(data)))
+
+
+def scale_frame(df: pd.DataFrame, scaler: dict) -> np.ndarray:
+    return ((df[scaler["features"]].to_numpy(float) - scaler["mean"]) / scaler["scale"]).astype(np.float32)
+
+
+def target_stats(scaler: dict) -> tuple[float, float]:
+    i = scaler["features"].index(TARGET)
+    return float(scaler["mean"][i]), float(scaler["scale"][i])
+
+
+# ---------------------------------------------------------------------------
+# Teks IMDB
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_tokenizer() -> dict | None:
+    p = find_file("tokenizer.json", "tokenizer_imdb.json", "imdb_tokenizer.json")
+    if p is None:
+        return None
+    raw = json.loads(p.read_text())
+    cfg = raw.get("config", raw)
+    wi = cfg.get("word_index", raw.get("word_index"))
+    if isinstance(wi, str):
+        wi = json.loads(wi)
+    if wi is None and all(isinstance(v, int) for v in list(raw.values())[:50]):
+        wi = raw
+    if not wi:
+        return None
+    num_words = cfg.get("num_words") or raw.get("num_words") or raw.get("vocab_size") or 20000
+    oov_tok = cfg.get("oov_token") or raw.get("oov_token") or "<OOV>"
+    return {"word_index": {k: int(v) for k, v in wi.items()}, "num_words": int(num_words),
+            "oov": int(wi.get(oov_tok, 1))}
 
 
 def clean_text(text: str) -> str:
-    text = re.sub(r"<.*?>", " ", text)
+    text = re.sub(r"<.*?>", " ", str(text))
     text = text.lower()
     text = re.sub(r"[^a-z\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-def teks_ke_sequence(text: str, word_index: dict):
-    kata = clean_text(text).split()
-    idx, dikenal = [], 0
-    for w in kata:
-        i = word_index.get(w, OOV_INDEX)
-        if i >= VOCAB_SIZE:
-            i = OOV_INDEX
-        if i != OOV_INDEX:
-            dikenal += 1
-        idx.append(i)
-    seq = np.zeros(SEQ_LEN_TEXT, dtype=np.int32)
-    if idx:
-        potong = idx[-SEQ_LEN_TEXT:]          # truncating='pre'
-        seq[-len(potong):] = potong           # padding='pre'
-    return seq, len(kata), dikenal
+def to_ids(words: list[str], tok: dict) -> list[int]:
+    wi, n, oov = tok["word_index"], tok["num_words"], tok["oov"]
+    ids = []
+    for w in words:
+        i = wi.get(w)
+        ids.append(oov if i is None or i >= n else i)
+    return ids
 
 
-def prediksi_sentimen(model, word_index, text: str):
-    seq, n_kata, dikenal = teks_ke_sequence(text, word_index)
-    p = float(model.predict(seq[np.newaxis, :], verbose=0).flatten()[0])
-    return p, n_kata, dikenal
+def pad_pre(ids: list[int], L: int) -> np.ndarray:
+    ids = ids[-L:]
+    return np.array([0] * (L - len(ids)) + ids, dtype=np.int32)
 
 
-# --------------------------------------------------------------------------- #
-# Sidebar
-# --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.markdown("## 🌡️ SequenceLab")
-    st.caption("LSTM & GRU · Deployment Week 5")
-    halaman = st.radio(
-        "Menu",
-        ["Beranda", "Prediksi Suhu (LSTM)", "Analisis Sentimen (GRU)", "Versioning & Info"],
-        label_visibility="collapsed",
-    )
-    st.divider()
-    st.markdown("**Status model**")
-    st.markdown(("🟢" if artefak_ada(TEMP_MODEL_PATH, SCALER_PATH) else "🔴") + " LSTM suhu")
-    st.markdown(("🟢" if artefak_ada(SENT_MODEL_PATH, TOKENIZER_PATH) else "🔴") + " GRU sentimen")
-    st.divider()
+# ---------------------------------------------------------------------------
+# Komponen kecil
+# ---------------------------------------------------------------------------
+def reading(label: str, value: str, sub: str, tone: str, facts: list[tuple[str, str]] | None = None) -> None:
+    facts_html = ""
+    if facts:
+        facts_html = '<div class="facts">' + "".join(
+            f"<div><b>{html.escape(v)}</b><span>{html.escape(k)}</span></div>" for k, v in facts) + "</div>"
     st.markdown(
-        f"**Akmal Nugraha Saputra**  \nCaAs 2609 · NIM 103052500014  \nVersi aplikasi: {APP_VERSION}"
+        f'<div class="reading" style="--tone:{tone}"><p class="label">{html.escape(label)}</p>'
+        f'<p class="value">{html.escape(value)}</p><p class="sub">{sub}</p>{facts_html}</div>',
+        unsafe_allow_html=True,
     )
 
 
-# --------------------------------------------------------------------------- #
+def gauge(pos01: float, left: str, right: str, middle: str = "", aria: str = "") -> None:
+    mid = f"<span>{middle}</span>" if middle else ""
+    st.markdown(f'<div class="gauge" role="img" aria-label="{html.escape(aria)}">'
+                f'<div class="pin" style="left:{np.clip(pos01, 0, 1) * 100:.1f}%"></div></div>'
+                f'<div class="gauge-legend"><span>{left}</span>{mid}<span>{right}</span></div>',
+                unsafe_allow_html=True)
+
+
+def legend_chips(items: list[tuple[str, str, str]]) -> None:
+    """items: (label, warna, bentuk) bentuk = 'line' | 'dot' | 'diamond' | 'dash'"""
+    parts = []
+    for label, color, shape in items:
+        if shape == "line":
+            mark = f'<i style="display:inline-block;width:18px;height:3px;background:{color};vertical-align:middle"></i>'
+        elif shape == "dash":
+            mark = f'<i style="display:inline-block;width:18px;border-top:3px dashed {color};vertical-align:middle"></i>'
+        elif shape == "diamond":
+            mark = f'<i style="display:inline-block;width:9px;height:9px;background:{color};transform:rotate(45deg);vertical-align:middle"></i>'
+        else:
+            mark = f'<i style="display:inline-block;width:11px;height:11px;border-radius:50%;background:{color};vertical-align:middle"></i>'
+        parts.append(f'<span style="margin-right:1.1rem;white-space:nowrap">{mark}&nbsp;&nbsp;{html.escape(label)}</span>')
+    st.markdown(f'<div class="quiet">{"".join(parts)}</div>', unsafe_allow_html=True)
+
+
+def missing_box(what: str, files: str) -> None:
+    st.warning(
+        f"{what} belum bisa dijalankan karena file berikut tidak ditemukan di folder `models/`: "
+        f"{files}. Unggah file tersebut ke repositori GitHub, lalu muat ulang halaman ini."
+    )
+
+
+def engine_picker(key: str) -> str:
+    choice = st.segmented_control(
+        "Mesin prediksi", ["Keras (.h5)", "TFLite ringan"], default="TFLite ringan", key=key,
+        help="TFLite ringan memakai model yang dikuantisasi ke int8: ukurannya sekitar 4 kali lebih kecil "
+             "dan biasanya lebih cepat untuk satu prediksi. Hasilnya hampir sama dengan Keras.",
+    )
+    return "keras" if choice == "Keras (.h5)" else "tflite"
+
+
+# ---------------------------------------------------------------------------
 # Halaman: Beranda
-# --------------------------------------------------------------------------- #
-def halaman_beranda():
+# ---------------------------------------------------------------------------
+def page_home() -> None:
+    st.markdown('<div class="hero-title" role="heading" aria-level="1">Runtun</div>', unsafe_allow_html=True)
     st.markdown(
-        """
-        <div class="hero">
-          <div>
-            <h1>Dua model sequential, satu aplikasi</h1>
-            <p>Coba langsung model terbaik dari Tugas Week 3: LSTM untuk meramal suhu udara
-            satu jam ke depan dari data cuaca Jena, dan GRU untuk menebak sentimen ulasan film IMDB.
-            Pilih model di menu sebelah kiri.</p>
-          </div>
-          <div class="tag">Week 3 → Week 5 Deployment</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        '<p class="hero-lede">Dua model yang membaca urutan: suhu udara jam demi jam, '
+        'dan kata demi kata dalam ulasan film.</p>', unsafe_allow_html=True)
 
-    c1, c2 = st.columns(2)
-    with c1:
+    sample, scaler = load_jena_sample(), load_scaler()
+    if sample is not None and TARGET in sample.columns:
+        daily = sample[TARGET].resample("D").mean().dropna()
+        st.markdown(stripes_html(daily.values, -10, 25), unsafe_allow_html=True)
         st.markdown(
-            """
-            <div class="card warm">
-              <h3>🌡️ Prediksi suhu · LSTM</h3>
-              <p class="sub">Jena Climate 2009–2016 · 13 variabel cuaca · jendela 72 jam</p>
-              <div class="metric-row">
-                <div class="metric"><div class="v">0,477 °C</div><div class="l">MAE data uji</div></div>
-                <div class="metric"><div class="v">0,669 °C</div><div class="l">RMSE data uji</div></div>
-                <div class="metric"><div class="v">20.033</div><div class="l">parameter</div></div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            """
-            <div class="card cool">
-              <h3>🎬 Analisis sentimen · GRU</h3>
-              <p class="sub">IMDB 50K Movie Reviews · vocabulary 20.000 kata · 400 token</p>
-              <div class="metric-row">
-                <div class="metric"><div class="v">89,35 %</div><div class="l">akurasi data uji</div></div>
-                <div class="metric"><div class="v">0,895</div><div class="l">F1-score</div></div>
-                <div class="metric"><div class="v">1,31 jt</div><div class="l">parameter</div></div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("### Cara memakai")
-    st.markdown(
-        """
-        <ol class="steps">
-          <li><b>Prediksi Suhu:</b> pakai data contoh yang sudah disediakan, atau unggah CSV Jena
-              (format asli 10 menit maupun per jam). Geser jendela waktu, lalu klik <i>Prediksi</i>.
-              Kalau data punya jam berikutnya, aplikasi ikut menampilkan nilai aktual sebagai pembanding.</li>
-          <li><b>Analisis Sentimen:</b> tulis ulasan film berbahasa Inggris atau pilih contoh, lalu klik
-              <i>Analisis</i>. Ada juga mode batch untuk banyak ulasan sekaligus dari file CSV.</li>
-          <li><b>Versioning & Info:</b> catatan perubahan tiap versi deployment beserta ringkasan
-              eksperimen 8 skenario dari notebook.</li>
-        </ol>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("Kenapa dua model ini yang dipilih?"):
-        st.markdown(
-            """
-            Dari 16 skenario yang dilatih di Week 3 (LSTM/GRU × shallow/deep × 2 sequence length untuk
-            masing-masing dataset), dua skenario ini punya skor uji terbaik:
-
-            | Tugas | Model terbaik | Skor uji |
-            |---|---|---|
-            | Jena Climate (regresi) | LSTM, 1 layer 64 unit, seq 72 | MAE 0,4772 °C · RMSE 0,6685 °C |
-            | IMDB (klasifikasi) | GRU, 1 layer 64 unit, seq 400 | Accuracy 0,8935 · F1 0,8949 |
-
-            Konfigurasi 1 layer mengungguli 2 layer + dropout pada kedua dataset, jadi model yang lebih
-            kecil justru dipakai untuk deployment: lebih ringan dan lebih cepat merespons.
-            """
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Halaman: Prediksi Suhu
-# --------------------------------------------------------------------------- #
-def halaman_suhu():
-    st.markdown("## 🌡️ Prediksi suhu 1 jam ke depan")
-    st.caption("LSTM · 1 layer 64 unit · input 72 jam terakhir × 13 variabel cuaca (Jena, Jerman)")
-
-    if not artefak_ada(TEMP_MODEL_PATH, SCALER_PATH):
-        st.error(
-            f"File model belum lengkap. Pastikan `{TEMP_MODEL_PATH}` dan `{SCALER_PATH}` ada di repo."
-        )
-        return
-
-    model = load_keras_model(TEMP_MODEL_PATH)
-    mean, scale = load_scaler(SCALER_PATH)
-
-    kiri, kanan = st.columns([1, 1.6], gap="large")
-    with kiri:
-        st.markdown("#### 1. Sumber data")
-        opsi = ["Data contoh (bawaan)", "Unggah CSV sendiri"]
-        if not os.path.exists(SAMPLE_JENA_PATH):
-            opsi = opsi[1:]
-        sumber = st.radio("Sumber data", opsi, label_visibility="collapsed")
-
-        df = None
-        if sumber.startswith("Data contoh"):
-            df = load_sample_jena(SAMPLE_JENA_PATH)
-            st.info(f"Data contoh: {len(df)} jam terakhir dari data uji (Okt 2015 – Des 2016).")
-        else:
-            up = st.file_uploader("CSV Jena Climate (10 menit atau per jam)", type=["csv"])
-            if up is not None:
-                df = pd.read_csv(up)
-
-        if df is None:
-            st.markdown(
-                '<div class="note">Unggah CSV dengan 13 kolom cuaca Jena, minimal 72 baris per jam '
-                '(atau 432 baris data 10 menit).</div>',
-                unsafe_allow_html=True,
-            )
-            return
-
-        try:
-            df = siapkan_jena(df)
-        except ValueError as e:
-            st.error(str(e))
-            return
-
-        if len(df) < SEQ_LEN_TEMP:
-            st.error(f"Data hanya {len(df)} jam. Model butuh minimal {SEQ_LEN_TEMP} jam.")
-            return
-
-        st.markdown("#### 2. Pilih jendela 72 jam")
-        akhir_max = len(df)
-        akhir = st.slider(
-            "Baris terakhir yang dipakai sebagai 'sekarang'",
-            min_value=SEQ_LEN_TEMP, max_value=akhir_max, value=akhir_max,
-            help="Geser ke kiri supaya jam berikutnya masih ada di data, jadi bisa dibandingkan dengan nilai aktual.",
-        )
-        n_langkah = st.slider(
-            "Ramalan lanjutan (jam)", 1, 12, 1,
-            help="Lebih dari 1 jam = prediksi berantai; nilai fitur lain diasumsikan tetap, jadi hanya estimasi kasar.",
-        )
-        tombol = st.button("Prediksi suhu", type="primary", use_container_width=True)
-
-    window_df = df.iloc[akhir - SEQ_LEN_TEMP:akhir]
-    window = window_df[FEATURES].to_numpy(dtype=np.float32)
-    waktu = window_df["Date Time"] if "Date Time" in window_df.columns else pd.RangeIndex(akhir - SEQ_LEN_TEMP, akhir)
-
-    with kanan:
-        st.markdown("#### 3. Hasil")
-        if not tombol:
-            st.markdown(
-                '<div class="note">Atur jendela di kiri, lalu klik <b>Prediksi suhu</b>.</div>',
-                unsafe_allow_html=True,
-            )
-            _plot_suhu(waktu, window[:, TARGET_IDX], None, None, None)
-            return
-
-        with st.spinner("Menghitung…"):
-            hasil = []
-            w = window.copy()
-            for _ in range(n_langkah):
-                y = prediksi_suhu(model, mean, scale, w)
-                hasil.append(y)
-                baris_baru = w[-1].copy()
-                baris_baru[TARGET_IDX] = y
-                w = np.vstack([w[1:], baris_baru])
-
-        suhu_terakhir = float(window[-1, TARGET_IDX])
-        pred1 = hasil[0]
-        delta = pred1 - suhu_terakhir
-        aktual = float(df.iloc[akhir][TARGET]) if akhir < len(df) else None
-
-        st.markdown(
-            f"""
-            <div class="result temp">
-              <div class="lbl">Suhu 1 jam berikutnya (prediksi)</div>
-              <div class="big">{pred1:.2f} °C</div>
-              <div class="lbl">Suhu terakhir {suhu_terakhir:.2f} °C · perubahan {delta:+.2f} °C</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Prediksi 1 jam", f"{pred1:.2f} °C", f"{delta:+.2f} °C")
-        if aktual is not None:
-            m2.metric("Aktual di data", f"{aktual:.2f} °C")
-            m3.metric("Selisih", f"{abs(pred1 - aktual):.2f} °C")
-        else:
-            m2.metric("Rata-rata 72 jam", f"{window[:, TARGET_IDX].mean():.2f} °C")
-            m3.metric("Min / maks 72 jam", f"{window[:, TARGET_IDX].min():.0f} / {window[:, TARGET_IDX].max():.0f} °C")
-
-        _plot_suhu(waktu, window[:, TARGET_IDX], hasil, aktual, df if akhir < len(df) else None)
-
-        if n_langkah > 1:
-            tabel = pd.DataFrame({"Jam ke-": range(1, n_langkah + 1), "Prediksi (°C)": np.round(hasil, 2)})
-            st.dataframe(tabel, hide_index=True, use_container_width=True)
-
-    with st.expander("Lihat 72 jam data yang dipakai"):
-        st.dataframe(window_df, use_container_width=True, height=260)
-
-    with st.expander("Tentang model ini"):
-        st.markdown(
-            """
-            - Arsitektur: `Input(72, 13) → LSTM(64) → Dense(1)`, 20.033 parameter, Adam lr 0,001, loss MSE.
-            - Data dinormalisasi dengan StandardScaler yang di-fit pada data training (2009–Agu 2014).
-            - Evaluasi data uji (Okt 2015 – Des 2016): **MAE 0,4772 °C**, **RMSE 0,6685 °C**.
-            - Kolom `Tpot (K)` dibuang karena hampir identik dengan target; nilai angin -9999 dianggap 0.
-            """
-        )
-
-
-def _plot_suhu(waktu, suhu, hasil, aktual, df_lanjut):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=list(waktu), y=suhu, mode="lines", name="72 jam terakhir",
-        line=dict(color="#2F5BEA", width=2.2),
-    ))
-    if hasil:
-        if isinstance(waktu, pd.Series) and pd.api.types.is_datetime64_any_dtype(waktu):
-            t_akhir = waktu.iloc[-1]
-            x_pred = [t_akhir + pd.Timedelta(hours=i) for i in range(1, len(hasil) + 1)]
-            x_link = [t_akhir] + x_pred
-        else:
-            akhir = list(waktu)[-1]
-            x_pred = [akhir + i for i in range(1, len(hasil) + 1)]
-            x_link = [akhir] + x_pred
-        fig.add_trace(go.Scatter(
-            x=x_link, y=[suhu[-1]] + list(hasil), mode="lines+markers", name="Prediksi",
-            line=dict(color="#FF7A45", width=2.5, dash="dot"), marker=dict(size=9),
-        ))
-        if aktual is not None:
-            fig.add_trace(go.Scatter(
-                x=[x_pred[0]], y=[aktual], mode="markers", name="Aktual",
-                marker=dict(color="#17A2A0", size=12, symbol="diamond"),
-            ))
-    fig.update_layout(
-        height=340, margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#FFFFFF",
-        legend=dict(orientation="h", y=1.08, x=0),
-        yaxis_title="T (°C)", xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#EEF1F6"),
-        font=dict(family="IBM Plex Sans, sans-serif"),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# --------------------------------------------------------------------------- #
-# Halaman: Analisis Sentimen
-# --------------------------------------------------------------------------- #
-def halaman_sentimen():
-    st.markdown("## 🎬 Analisis sentimen ulasan film")
-    st.caption("GRU · Embedding 64 dim · 1 layer 64 unit · 400 token · IMDB 50K Reviews (bahasa Inggris)")
-
-    if not artefak_ada(SENT_MODEL_PATH, TOKENIZER_PATH):
-        st.error(
-            f"File model belum lengkap. Pastikan `{SENT_MODEL_PATH}` dan `{TOKENIZER_PATH}` ada di repo."
-        )
-        return
-
-    model = load_keras_model(SENT_MODEL_PATH)
-    word_index = load_word_index(TOKENIZER_PATH)
-
-    tab1, tab2 = st.tabs(["Satu ulasan", "Banyak ulasan (batch)"])
-
-    with tab1:
-        if "ulasan" not in st.session_state:
-            st.session_state["ulasan"] = ""
-
-        st.markdown("Coba contoh:")
-        kolom = st.columns(len(CONTOH_ULASAN))
-        for (nama, teks), kol in zip(CONTOH_ULASAN.items(), kolom):
-            if kol.button(nama, use_container_width=True):
-                st.session_state["ulasan"] = teks
-
-        teks = st.text_area(
-            "Tulis ulasan film (bahasa Inggris)", key="ulasan", height=170,
-            placeholder="Contoh: The movie was surprisingly good, the pacing never dropped and…",
-        )
-        tombol = st.button("Analisis sentimen", type="primary")
-
-        if tombol:
-            if not teks.strip():
-                st.warning("Ulasannya masih kosong.")
-            else:
-                with st.spinner("Menganalisis…"):
-                    p, n_kata, dikenal = prediksi_sentimen(model, word_index, teks)
-                _tampilkan_hasil_sentimen(p, n_kata, dikenal)
-
-    with tab2:
-        st.markdown(
-            "Unggah CSV dengan kolom `review` (atau file `.txt`, satu ulasan per baris). "
-            "Hasilnya bisa diunduh kembali sebagai CSV."
-        )
-        up = st.file_uploader("File ulasan", type=["csv", "txt"])
-        if up is not None:
-            if up.name.endswith(".txt"):
-                baris = [b.strip() for b in up.read().decode("utf-8").splitlines() if b.strip()]
-                df = pd.DataFrame({"review": baris})
-            else:
-                df = pd.read_csv(up)
-                if "review" not in df.columns:
-                    st.error("CSV harus punya kolom bernama `review`.")
-                    df = None
-            if df is not None and len(df):
-                df = df.head(500)
-                if st.button("Analisis semua", type="primary"):
-                    with st.spinner(f"Menganalisis {len(df)} ulasan…"):
-                        seqs = np.stack([teks_ke_sequence(str(t), word_index)[0] for t in df["review"]])
-                        prob = model.predict(seqs, verbose=0).flatten()
-                    df["prob_positif"] = np.round(prob, 4)
-                    df["sentimen"] = np.where(prob > 0.5, "positive", "negative")
-                    pos = int((prob > 0.5).sum())
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Total ulasan", len(df))
-                    c2.metric("Positif", pos)
-                    c3.metric("Negatif", len(df) - pos)
-                    st.dataframe(df, use_container_width=True, height=320)
-                    st.download_button(
-                        "Unduh hasil (CSV)", df.to_csv(index=False).encode("utf-8"),
-                        "hasil_sentimen.csv", "text/csv",
-                    )
-
-    with st.expander("Tentang model ini"):
-        st.markdown(
-            """
-            - Arsitektur: `Input(400) → Embedding(20000, 64) → GRU(64) → Dense(1, sigmoid)`, 1.305.025 parameter.
-            - Teks dibersihkan persis seperti saat training: tag HTML dihapus, huruf kecil, hanya huruf a–z.
-              Kata di luar 20.000 kosakata teratas jadi `<OOV>`; ulasan > 400 kata dipotong dari depan
-              supaya bagian akhir (biasanya kesimpulan penulis) tetap dipakai.
-            - Evaluasi data uji (7.438 ulasan): **Accuracy 0,8935 · Precision 0,8865 · Recall 0,9036 · F1 0,8949**.
-            - Ambang keputusan 0,5. Nilai di sekitar 0,4–0,6 berarti model ragu, biasanya pada ulasan campuran atau sarkastik.
-            """
-        )
-
-
-def _tampilkan_hasil_sentimen(p: float, n_kata: int, dikenal: int):
-    if p >= 0.6:
-        kelas, label, emoji = "pos", "Positif", "👍"
-    elif p <= 0.4:
-        kelas, label, emoji = "neg", "Negatif", "👎"
+            f'<div class="stripe-legend"><span>{tgl_pendek(daily.index[0])}</span>'
+            f'<span>Setiap garis adalah rata-rata suhu satu hari di Jena, Jerman. Biru lebih dingin, merah lebih hangat.</span>'
+            f'<span>{tgl_pendek(daily.index[-1])}</span></div>', unsafe_allow_html=True)
     else:
-        kelas, label, emoji = "mid", "Positif" if p > 0.5 else "Negatif", "🤔"
-    keyakinan = p if p > 0.5 else 1 - p
+        st.markdown(stripes_html(np.sin(np.linspace(0, 2 * np.pi, 120)) * 15 + 7, -10, 25), unsafe_allow_html=True)
 
+    st.write("")
+    models = find_models()
+    left, right = st.columns(2, gap="large")
+    with left:
+        best = models["jena"][0] if models["jena"] else None
+        mae = JENA_METRICS.get((best["cell"], best["cfg"], best["seq"]), (None,))[0] if best else None
+        st.markdown(
+            f"""<div class="entry"><h3>Prakiraan suhu</h3>
+<p>Berikan 72 jam data cuaca terakhir, model menebak suhu satu jam berikutnya.</p>
+<div class="num">±{mae:.2f} °C</div><div class="num-label">rata-rata meleset pada data uji 2015–2016</div></div>"""
+            if mae else '<div class="entry"><h3>Prakiraan suhu</h3><p>Model belum diunggah.</p></div>',
+            unsafe_allow_html=True)
+        st.write("")
+        st.page_link(PAGES["suhu"], label="Buka prakiraan suhu", icon=":material/thermostat:")
+    with right:
+        best = models["imdb"][0] if models["imdb"] else None
+        acc = IMDB_METRICS.get((best["cell"], best["cfg"], best["seq"]), (None,))[0] if best else None
+        st.markdown(
+            f"""<div class="entry"><h3>Pembaca ulasan film</h3>
+<p>Tempel ulasan film berbahasa Inggris, model menilai apakah sambutannya hangat atau dingin.</p>
+<div class="num">{acc * 100:.1f}%</div><div class="num-label">ulasan uji yang ditebak benar</div></div>"""
+            if acc else '<div class="entry"><h3>Pembaca ulasan film</h3><p>Model belum diunggah.</p></div>',
+            unsafe_allow_html=True)
+        st.write("")
+        st.page_link(PAGES["sentimen"], label="Buka pembaca ulasan", icon=":material/movie:")
+
+    st.divider()
+    c1, c2 = st.columns([1.1, 1], gap="large")
+    with c1:
+        st.subheader("Cara memakai")
+        st.markdown(
+            """<ol class="steps">
+<li>Pilih halaman di menu atas: prakiraan suhu atau pembaca ulasan.</li>
+<li>Pakai data contoh yang sudah tersedia, atau unggah data sendiri.</li>
+<li>Tekan tombol prediksi. Hasil muncul di panel berwarna, lengkap dengan penjelasannya.</li>
+</ol>""", unsafe_allow_html=True)
+    with c2:
+        st.subheader("Kenapa satu warna")
+        st.markdown(
+            "Kedua model memakai skala yang sama dari biru ke merah. Untuk suhu, biru berarti dingin. "
+            "Untuk ulasan, biru berarti penonton kecewa dan merah berarti penonton puas.")
+        st.markdown(f'<div class="gauge" aria-hidden="true"></div>'
+                    f'<div class="gauge-legend"><span>Dingin</span><span>Hangat</span></div>',
+                    unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Halaman: Prakiraan suhu
+# ---------------------------------------------------------------------------
+def page_forecast() -> None:
+    st.title("Prakiraan suhu satu jam ke depan")
+    st.markdown('<p class="quiet">Model membaca 13 variabel cuaca (tekanan, kelembapan, angin, dan lainnya) '
+                'selama beberapa jam terakhir, lalu menebak suhu udara pada jam berikutnya.</p>',
+                unsafe_allow_html=True)
+
+    models, scaler = find_models()["jena"], load_scaler()
+    if not models or scaler is None:
+        missing_box("Prakiraan suhu", "`LSTM_A_seq72.h5` (atau model Jena lain) dan `scaler.json`")
+        return
+
+    with st.container(border=True):
+        a, b, c = st.columns([1.4, 1.2, 1], gap="medium")
+        with a:
+            labels = {model_label(d): d for d in models}
+            chosen = labels[st.selectbox("Model", list(labels), help="Urutan teratas adalah model dengan galat terkecil di notebook.")]
+        with b:
+            source = st.radio("Sumber data", ["Data uji Jena", "Unggah CSV"], horizontal=True,
+                              help="Data uji Jena adalah periode Okt 2015 sampai Des 2016 yang tidak dipakai saat training.")
+        with c:
+            engine = engine_picker("eng_jena")
+
+    df = None
+    if source == "Unggah CSV":
+        up = st.file_uploader("Unggah CSV dengan kolom seperti dataset Jena Climate (termasuk `Date Time`)",
+                              type="csv", help="Data per 10 menit otomatis diubah menjadi per jam, sama seperti di notebook.")
+        if up is None:
+            st.info("Belum ada file. Kolom yang dibutuhkan: `Date Time` dan " + ", ".join(f"`{f}`" for f in scaler["features"]) + ".")
+            return
+        try:
+            df = read_uploaded_csv(up.getvalue())
+        except Exception as e:  # pesan singkat yang bisa ditindaklanjuti
+            st.error(f"File tidak bisa dibaca sebagai CSV cuaca: {e}")
+            return
+    else:
+        df = load_jena_sample()
+        if df is None:
+            missing_box("Data contoh", "`sample_jena.csv`")
+            return
+
+    missing = [f for f in scaler["features"] if f not in df.columns]
+    if missing:
+        st.error("Kolom berikut tidak ada di data: " + ", ".join(f"`{m}`" for m in missing))
+        return
+    df = df.dropna(subset=scaler["features"])
+    seq = chosen["seq"]
+    if len(df) <= seq:
+        st.error(f"Data terlalu pendek. Model ini butuh minimal {seq + 1} jam data, file ini hanya {len(df)} jam.")
+        return
+
+    scaled = scale_frame(df, scaler)
+    t_mean, t_std = target_stats(scaler)
+    temps = df[TARGET].to_numpy(float)
+    times = df.index
+
+    tab1, tab2 = st.tabs(["Satu jam tertentu", "Uji rentang waktu"])
+    ctx = dict(models=models, chosen=chosen, engine=engine, scaled=scaled, temps=temps, times=times,
+               t_mean=t_mean, t_std=t_std, seq=seq)
+    with tab1:
+        forecast_single(**ctx)
+    with tab2:
+        forecast_range(**ctx)
+
+
+def forecast_single(models, chosen, engine, scaled, temps, times, t_mean, t_std, seq) -> None:
+    first, last = times[seq].to_pydatetime(), times[-1].to_pydatetime() + pd.Timedelta(hours=1)
+    default = pd.Timestamp("2016-07-20 15:00")
+    if not (times[seq] <= default <= times[-1]):
+        default = times[-1]
+    d1, d2 = st.columns([1, 2])
+    with d1:
+        day = st.date_input("Tanggal", value=default.date(), min_value=first.date(), max_value=last.date(), format="DD/MM/YYYY")
+    with d2:
+        hour = st.select_slider("Jam yang ingin ditebak", options=list(range(24)), value=int(default.hour),
+                                format_func=lambda h: f"{h:02d}.00")
+    target_time = pd.Timestamp(day) + pd.Timedelta(hours=hour)
+
+    # posisi jam target di data; jika melewati akhir data, prediksi masa depan
+    pos = int(times.searchsorted(target_time))
+    future = pos >= len(times)
+    exact = (not future) and times[pos] == target_time
+    if not future and not exact:
+        target_time = times[pos]
+    if pos < seq:
+        st.warning(f"Jam ini terlalu awal. Pilih waktu setelah {times[seq]:%d/%m/%Y %H.00} agar ada {seq} jam riwayat.")
+        return
+
+    window = scaled[pos - seq:pos][None, ...]
+    with st.spinner("Model sedang membaca riwayat cuaca..."):
+        pred_s, ms = run_model(str(chosen["path"]), window, engine)
+    pred = float(pred_s[0] * t_std + t_mean)
+    actual = None if future else float(temps[pos])
+    prev = float(temps[pos - 1])
+
+    left, right = st.columns([1, 1.6], gap="large")
+    with left:
+        when = tanggal_id(target_time)
+        if actual is None:
+            sub = f"Ini tebakan untuk jam setelah data berakhir. Satu jam sebelumnya suhunya {prev:.1f} °C."
+            facts = [("jam sebelumnya", f"{prev:.1f} °C"), ("waktu hitung", f"{ms:.1f} ms")]
+        else:
+            err = pred - actual
+            sub = f"Suhu yang tercatat sebenarnya {actual:.1f} °C, jadi tebakan meleset {abs(err):.2f} °C."
+            facts = [("suhu sebenarnya", f"{actual:.1f} °C"), ("selisih", f"{err:+.2f} °C"),
+                     ("jam sebelumnya", f"{prev:.1f} °C"), ("waktu hitung", f"{ms:.1f} ms")]
+        reading(f"Tebakan suhu, {when}", f"{pred:.1f} °C", sub, temp_color(pred) if abs(pred - 10) > 6 else COLD, facts)
+        gauge((pred + 10) / 40, "−10 °C", "30 °C", "10 °C", f"Posisi suhu {pred:.1f} derajat pada skala")
+    with right:
+        hist = pd.DataFrame({"waktu": times[pos - seq:pos], "suhu": temps[pos - seq:pos], "jenis": "Riwayat"})
+        pts = [{"waktu": target_time, "suhu": pred, "jenis": "Tebakan model"}]
+        if actual is not None:
+            pts.append({"waktu": target_time, "suhu": actual, "jenis": "Suhu sebenarnya"})
+        pts = pd.DataFrame(pts)
+        color = alt.Scale(domain=["Riwayat", "Tebakan model", "Suhu sebenarnya"], range=[INK, WARM, COLD])
+        base = alt.Chart(hist).mark_line(strokeWidth=2).encode(
+            x=alt.X("waktu:T", title=None, axis=alt.Axis(format="%d/%m %H.00", labelAngle=0, tickCount=6)),
+            y=alt.Y("suhu:Q", title="Suhu (°C)", scale=alt.Scale(zero=False)),
+            color=alt.Color("jenis:N", scale=color, legend=None),
+            tooltip=[alt.Tooltip("waktu:T", format="%d/%m/%Y %H.00"), alt.Tooltip("suhu:Q", format=".1f")])
+        dots = alt.Chart(pts).mark_point(size=160, filled=True, opacity=1).encode(
+            x="waktu:T", y="suhu:Q", color=alt.Color("jenis:N", scale=color, legend=None),
+            shape=alt.Shape("jenis:N", scale=alt.Scale(domain=["Tebakan model", "Suhu sebenarnya"],
+                                                       range=["circle", "diamond"]), legend=None),
+            tooltip=["jenis:N", alt.Tooltip("suhu:Q", format=".2f")])
+        st.markdown(f"**{seq} jam yang dibaca model**")
+        legend_chips([("Riwayat suhu", INK, "line"), ("Tebakan model", WARM, "dot")]
+                     + ([("Suhu sebenarnya", COLD, "diamond")] if actual is not None else []))
+        st.altair_chart((base + dots).properties(height=300), use_container_width=True)
+
+    # garis warna 72 jam (konteks cepat)
+    st.markdown(stripes_html(temps[pos - seq:pos], -10, 30, small=True), unsafe_allow_html=True)
+    st.markdown(f'<div class="stripe-legend"><span>{times[pos - seq]:%d/%m %H.00}</span>'
+                f'<span>suhu per jam yang dibaca model</span><span>{times[pos - 1]:%d/%m %H.00}</span></div>',
+                unsafe_allow_html=True)
+
+
+def forecast_range(models, chosen, engine, scaled, temps, times, t_mean, t_std, seq) -> None:
+    st.markdown("Model menebak setiap jam dalam rentang yang kamu pilih, lalu hasilnya dibandingkan "
+                "dengan suhu yang benar-benar tercatat.")
+    r1, r2, r3 = st.columns([1, 1, 1.2])
+    max_seq = max(d["seq"] for d in models)
+    valid_start, valid_end = times[max_seq], times[-1]
+    with r1:
+        start_day = st.date_input("Mulai", value=max(valid_start, pd.Timestamp("2016-07-01")).date()
+                                  if valid_end >= pd.Timestamp("2016-07-01") else valid_start.date(),
+                                  min_value=valid_start.date(), max_value=valid_end.date(), format="DD/MM/YYYY", key="rs")
+    with r2:
+        days = st.slider("Panjang (hari)", 1, 14, 7)
+    with r3:
+        compare = st.checkbox("Bandingkan semua model yang tersedia", value=len(models) > 1,
+                              disabled=len(models) < 2,
+                              help="Aktif jika ada lebih dari satu model Jena di folder models/.")
+    run = st.button("Jalankan uji rentang", type="primary")
+    if run:
+        s = max(int(times.searchsorted(pd.Timestamp(start_day))), max_seq)
+        e = min(s + days * 24, len(times))
+        idx = np.arange(s, e)
+        chosen_list = models if compare else [chosen]
+        frames, rows = [pd.DataFrame({"waktu": times[idx], "suhu": temps[idx], "seri": "Suhu sebenarnya"})], []
+        prog = st.progress(0.0, text="Menyiapkan jendela data...")
+        for n, d in enumerate(chosen_list):
+            X = np.stack([scaled[i - d["seq"]:i] for i in idx])
+            p, ms = run_model(str(d["path"]), X, engine)
+            p = p * t_std + t_mean
+            err = p - temps[idx]
+            rows.append({"Model": model_label(d), "MAE (°C)": np.abs(err).mean(),
+                         "RMSE (°C)": np.sqrt((err ** 2).mean()), "Waktu per tebakan (ms)": ms})
+            frames.append(pd.DataFrame({"waktu": times[idx], "suhu": p, "seri": model_label(d)}))
+            prog.progress((n + 1) / len(chosen_list), text=f"Selesai: {model_label(d)}")
+        prog.empty()
+        res = pd.DataFrame(rows).sort_values("MAE (°C)")
+        best = res.iloc[0]
+        reading("Rata-rata meleset dalam rentang ini", f"±{best['MAE (°C)']:.2f} °C",
+                f"{best['Model']} pada {len(idx)} jam, {times[idx[0]]:%d/%m/%Y} sampai {times[idx[-1]]:%d/%m/%Y}.",
+                COLD, [("RMSE", f"{best['RMSE (°C)']:.2f} °C"), ("jam diuji", f"{len(idx)}"),
+                       ("waktu per tebakan", f"{best['Waktu per tebakan (ms)']:.2f} ms")])
+        st.write("")
+        plot = pd.concat(frames)
+        series = list(plot["seri"].unique())
+        palette = [INK, WARM, COLD, "#E0A21B", "#3F8F6B", "#7A5AC8"][: len(series)]
+        chart = alt.Chart(plot).mark_line(strokeWidth=1.8).encode(
+            x=alt.X("waktu:T", title=None, axis=alt.Axis(format="%d/%m", labelAngle=0, tickCount="day")),
+            y=alt.Y("suhu:Q", title="Suhu (°C)", scale=alt.Scale(zero=False)),
+            color=alt.Color("seri:N", legend=None, scale=alt.Scale(domain=series, range=palette)),
+            strokeDash=alt.condition(alt.datum.seri == "Suhu sebenarnya", alt.value([1, 0]), alt.value([5, 3])),
+            tooltip=["seri:N", alt.Tooltip("waktu:T", format="%d/%m %H.00"), alt.Tooltip("suhu:Q", format=".2f")])
+        legend_chips([(ser, col, "line" if ser == "Suhu sebenarnya" else "dash") for ser, col in zip(series, palette)])
+        st.altair_chart(chart.properties(height=340).interactive(bind_y=False), use_container_width=True)
+        st.dataframe(res.style.format({"MAE (°C)": "{:.3f}", "RMSE (°C)": "{:.3f}", "Waktu per tebakan (ms)": "{:.2f}"}),
+                     hide_index=True, use_container_width=True)
+        out = plot.pivot_table(index="waktu", columns="seri", values="suhu").reset_index()
+        st.download_button("Unduh hasil (CSV)", out.to_csv(index=False).encode(), "prakiraan_suhu.csv", "text/csv")
+
+
+# ---------------------------------------------------------------------------
+# Halaman: Pembaca ulasan
+# ---------------------------------------------------------------------------
+def verdict_text(p: float) -> tuple[str, str]:
+    if p >= 0.5:
+        strength = "sangat yakin" if p >= 0.85 else "cukup yakin" if p >= 0.65 else "ragu-ragu"
+        return "Sambutan hangat", f"Model {strength} ulasan ini positif."
+    strength = "sangat yakin" if p <= 0.15 else "cukup yakin" if p <= 0.35 else "ragu-ragu"
+    return "Sambutan dingin", f"Model {strength} ulasan ini negatif."
+
+
+def page_sentiment() -> None:
+    st.title("Pembaca ulasan film")
+    st.markdown('<p class="quiet">Model dilatih dari 50.000 ulasan IMDB berbahasa Inggris. '
+                'Tulis atau tempel ulasan dalam bahasa Inggris agar hasilnya bermakna.</p>', unsafe_allow_html=True)
+
+    models, tok = find_models()["imdb"], load_tokenizer()
+    if not models or tok is None:
+        missing_box("Pembaca ulasan", "`GRU_A_seq400.h5` (atau model IMDB lain) dan `tokenizer.json`")
+        return
+
+    with st.container(border=True):
+        a, c = st.columns([2, 1], gap="medium")
+        with a:
+            labels = {model_label(d): d for d in models}
+            chosen = labels[st.selectbox("Model", list(labels), key="imdb_model")]
+        with c:
+            engine = engine_picker("eng_imdb")
+    L = chosen["seq"]
+
+    tab1, tab2 = st.tabs(["Satu ulasan", "Banyak ulasan sekaligus"])
+    with tab1:
+        sentiment_single(chosen, engine, tok, L)
+    with tab2:
+        sentiment_batch(chosen, tok, L)
+
+
+def sentiment_single(chosen, engine, tok, L) -> None:
+    if "review" not in st.session_state:
+        st.session_state.review = EXAMPLES["Campur"]
+    ex = st.pills("Coba contoh", list(EXAMPLES), key="ex_pick", help="Klik salah satu untuk mengisi kotak ulasan.")
+    if ex and st.session_state.get("_last_ex") != ex:
+        st.session_state.review = EXAMPLES[ex]
+        st.session_state._last_ex = ex
+    text = st.text_area("Ulasan film (bahasa Inggris)", key="review", height=150,
+                        placeholder="Contoh: The story was touching and the acting was superb...")
+    explain = st.toggle("Tunjukkan kata yang paling berpengaruh", value=True,
+                        help="Setiap kata dihapus satu per satu untuk melihat seberapa jauh keyakinan model berubah.")
+    go = st.button("Baca ulasan", type="primary")
+
+    if go:
+        words = clean_text(text).split()
+        if len(words) < 3:
+            st.warning("Ulasan terlalu pendek. Tulis minimal tiga kata dalam bahasa Inggris.")
+            return
+        ids = to_ids(words, tok)
+        known = sum(1 for i in ids if i != tok["oov"])
+        if known / len(ids) < 0.4:
+            st.warning("Sebagian besar kata tidak dikenali model. Pastikan ulasannya ditulis dalam bahasa Inggris.")
+        x = pad_pre(ids, L)[None, :]
+        with st.spinner("Model sedang membaca ulasan..."):
+            p, ms = run_model(str(chosen["path"]), x, engine)
+        p = float(p[0])
+        title, sub = verdict_text(p)
+        tone = WARM if p >= 0.5 else COLD
+
+        left, right = st.columns([1.1, 1.1], gap="large")
+        with left:
+            reading("Hasil bacaan", title, f"Peluang positif {p * 100:.0f}%. {sub}", tone,
+                    [("jumlah kata", f"{len(words)}"), ("kata dikenal", f"{known / len(words) * 100:.0f}%"),
+                     ("waktu hitung", f"{ms:.1f} ms")])
+            gauge(p, "Dingin (negatif)", "Hangat (positif)", "Ragu", f"Keyakinan {p * 100:.0f} persen positif")
+            if len(words) > L:
+                st.caption(f"Ulasan lebih dari {L} kata, jadi model hanya membaca {L} kata terakhir, sama seperti saat training.")
+        with right:
+            if explain:
+                kept = words[-L:]
+                uniq = list(dict.fromkeys(kept))[:300]
+                base_ids = to_ids(kept, tok)
+                variants = np.stack([pad_pre([i for w, i in zip(kept, base_ids) if w != u], L) for u in uniq])
+                with st.spinner("Mengukur pengaruh tiap kata..."):
+                    q, _ = run_model(str(chosen["path"]), variants, "keras")
+                infl = dict(zip(uniq, p - q))  # >0 berarti kata itu mendorong ke positif
+                lim = max(max(abs(v) for v in infl.values()), 0.05)
+                spans = []
+                for w in kept:
+                    v = infl.get(w, 0.0)
+                    a = min(abs(v) / lim, 1.0)
+                    rgb = (200, 40, 62) if v > 0 else (44, 79, 184)
+                    style = f"background: rgba({rgb[0]},{rgb[1]},{rgb[2]},{0.08 + 0.55 * a:.2f})" if a > 0.08 else ""
+                    spans.append(f'<span style="{style}" title="{v:+.3f}">{html.escape(w)}</span>')
+                st.markdown("**Kata yang menggeser keputusan**")
+                st.markdown('<div class="marked">' + " ".join(spans) + "</div>", unsafe_allow_html=True)
+                top_pos = [w for w, v in sorted(infl.items(), key=lambda kv: -kv[1]) if v > 0.005][:5]
+                top_neg = [w for w, v in sorted(infl.items(), key=lambda kv: kv[1]) if v < -0.005][:5]
+                st.markdown(
+                    f'<p class="quiet" style="margin-top:.6rem">Merah mendorong ke positif: '
+                    f'{", ".join(top_pos) or "tidak ada"}. Biru mendorong ke negatif: {", ".join(top_neg) or "tidak ada"}.</p>',
+                    unsafe_allow_html=True)
+            else:
+                st.markdown("**Teks yang dibaca model**")
+                st.markdown('<div class="marked">' + html.escape(" ".join(words[-L:])) + "</div>", unsafe_allow_html=True)
+                st.caption("Huruf kecil semua, tanpa angka dan tanda baca: sama seperti pembersihan teks saat training.")
+
+
+def sentiment_batch(chosen, tok, L) -> None:
+    st.markdown("Unggah CSV berisi kolom `review`. Jika ada kolom `sentiment` (positive/negative), "
+                "aplikasi juga menghitung akurasinya.")
+    up = st.file_uploader("File CSV ulasan", type="csv", key="batch_csv")
+    sample_path = find_file("sample_ulasan.csv", "sample_imdb.csv")
+    use_sample = False
+    if up is None and sample_path is not None:
+        use_sample = st.checkbox("Pakai contoh ulasan dari data uji", value=False)
+    if up is None and not use_sample:
+        st.info("Belum ada file. Maksimal 2.000 baris per unggahan agar tetap cepat.")
+        return
+    data = pd.read_csv(up) if up is not None else pd.read_csv(sample_path)
+    tcol = next((c for c in data.columns if c.lower() in ("review", "text", "ulasan")), None)
+    if tcol is None:
+        obj = [c for c in data.columns if data[c].dtype == object]
+        tcol = obj[0] if obj else None
+    if tcol is None:
+        st.error("Tidak ada kolom teks. Beri nama kolom ulasan `review`.")
+        return
+    data = data.head(2000).copy()
+    if st.button("Baca semua ulasan", type="primary"):
+        X = np.stack([pad_pre(to_ids(clean_text(t).split(), tok), L) for t in data[tcol].astype(str)])
+        with st.spinner(f"Membaca {len(X)} ulasan..."):
+            probs, ms = run_model(str(chosen["path"]), X, "keras")
+        data["prob_positif"] = probs.round(4)
+        data["prediksi"] = np.where(probs >= 0.5, "positive", "negative")
+        lcol = next((c for c in data.columns if c.lower() in ("sentiment", "label")), None)
+        facts = [("ulasan dibaca", f"{len(data)}"), ("positif", f"{(probs >= .5).mean() * 100:.0f}%"),
+                 ("waktu per ulasan", f"{ms:.1f} ms")]
+        if lcol:
+            truth = data[lcol].astype(str).str.lower().map({"positive": "positive", "1": "positive",
+                                                           "negative": "negative", "0": "negative"})
+            acc = (truth == data["prediksi"]).mean()
+            reading("Akurasi pada file ini", f"{acc * 100:.1f}%", "Dibandingkan dengan kolom label di file.", COLD, facts)
+        else:
+            reading("Ulasan positif", f"{(probs >= .5).mean() * 100:.0f}%", "Dari seluruh ulasan di file.", thermal_color((probs >= .5).mean(), 0, 1), facts)
+        st.write("")
+        view = data.copy()
+        view[tcol] = view[tcol].astype(str).map(lambda t: t if len(t) <= 140 else t[:140] + "...")
+        st.dataframe(view, hide_index=True, use_container_width=True,
+                     column_config={"prob_positif": st.column_config.ProgressColumn(
+                         "Keyakinan positif", min_value=0.0, max_value=1.0, format="%.2f")})
+        st.download_button("Unduh hasil (CSV)", data.to_csv(index=False).encode(), "hasil_sentimen.csv", "text/csv")
+
+
+# ---------------------------------------------------------------------------
+# Halaman: Tentang model dan versi
+# ---------------------------------------------------------------------------
+def file_size(p: Path) -> str:
+    kb = p.stat().st_size / 1024
+    return f"{kb / 1024:.2f} MB" if kb > 1024 else f"{kb:.0f} KB"
+
+
+def page_about() -> None:
+    st.title("Tentang model dan versi")
+    models = find_models()
+
+    st.subheader("Model yang dipakai")
+    st.markdown('<p class="quiet">Semua angka di bawah berasal dari evaluasi test set di notebook Week 3 '
+                '(LSTM vs GRU). Aplikasi ini tidak melatih ulang model; yang dimuat adalah file .h5 hasil training di Colab.</p>',
+                unsafe_allow_html=True)
+    cols = st.columns(2, gap="large")
+    with cols[0]:
+        st.markdown("#### Prakiraan suhu (Jena Climate)")
+        for d in models["jena"]:
+            mae, rmse = JENA_METRICS.get((d["cell"], d["cfg"], d["seq"]), (float("nan"),) * 2)
+            n = PARAMS.get(("jena", d["cell"], d["cfg"]), 0)
+            st.markdown(f"**{model_label(d)}** <span class='pill'>{d['path'].name}</span>", unsafe_allow_html=True)
+            st.markdown(f"MAE {mae:.4f} °C, RMSE {rmse:.4f} °C, {n:,} parameter.".replace(f"{n:,}", f"{n:,}".replace(",", ".")))
+        st.markdown("Input 72 jam × 13 fitur yang dinormalisasi dengan StandardScaler dari data training. "
+                    "Output suhu satu jam berikutnya. Data dibagi kronologis 70/15/15.")
+    with cols[1]:
+        st.markdown("#### Sentimen ulasan (IMDB 50K)")
+        for d in models["imdb"]:
+            acc, pr, rc, f1 = IMDB_METRICS.get((d["cell"], d["cfg"], d["seq"]), (float("nan"),) * 4)
+            n = PARAMS.get(("imdb", d["cell"], d["cfg"]), 0)
+            st.markdown(f"**{model_label(d)}** <span class='pill'>{d['path'].name}</span>", unsafe_allow_html=True)
+            st.markdown(f"Akurasi {acc:.4f}, precision {pr:.4f}, recall {rc:.4f}, F1 {f1:.4f}, {n:,} parameter.".replace(f"{n:,}", f"{n:,}".replace(",", ".")))
+        st.markdown("Embedding 64 dimensi dengan kosakata 20.000 kata, lalu satu layer recurrent dan Dense sigmoid. "
+                    "Ulasan dipotong atau diberi padding di depan agar bagian akhir ulasan tetap terbaca.")
+
+    st.divider()
+    st.subheader("Optimasi")
     st.markdown(
-        f"""
-        <div class="result {kelas}">
-          <div class="lbl">Sentimen ulasan</div>
-          <div class="big">{emoji} {label}</div>
-          <div class="lbl">Keyakinan {keyakinan*100:.1f} % · probabilitas positif {p:.3f}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if kelas == "mid":
-        st.info("Model agak ragu di ulasan ini. Biasanya terjadi pada ulasan campuran atau sarkasme.")
+        "Tiga optimasi dipakai supaya aplikasi tetap ringan di Streamlit Cloud: "
+        "model dan data dimuat sekali lalu disimpan di cache (`st.cache_resource` dan `st.cache_data`), "
+        "TensorFlow baru diimpor saat halaman model dibuka, dan setiap model bisa dijalankan sebagai "
+        "TFLite dengan kuantisasi dinamis (bobot float32 menjadi int8).")
+    if st.button("Ukur ukuran dan kecepatan model"):
+        rows = []
+        prog = st.progress(0.0)
+        allm = models["jena"] + models["imdb"]
+        for n, d in enumerate(allm):
+            model = load_keras(str(d["path"]))
+            shape = (1,) + tuple(int(s) for s in model.input_shape[1:])
+            x = (np.random.randint(1, 20000, shape).astype(np.int32) if len(shape) == 2
+                 else np.random.randn(*shape).astype(np.float32))
+            xb = np.repeat(x, 20, axis=0)
+            run_model(str(d["path"]), x, "keras")
+            _, ms_k = run_model(str(d["path"]), xb, "keras")
+            tfl = build_tflite(str(d["path"]))
+            _, ms_t = run_model(str(d["path"]), xb, "tflite")
+            _, ms_k1 = run_model(str(d["path"]), x, "keras")
+            rows.append({"Model": d["path"].name, "Ukuran .h5": file_size(d["path"]),
+                         "Ukuran TFLite": f"{len(tfl) / 1024 / 1024:.2f} MB" if len(tfl) > 1048576 else f"{len(tfl) / 1024:.0f} KB",
+                         "Keras, 1 tebakan (ms)": round(ms_k1, 2), "TFLite, 1 tebakan (ms)": round(ms_t, 2)})
+            prog.progress((n + 1) / len(allm))
+        prog.empty()
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption("Ukuran .h5 termasuk state optimizer dari training. Kecepatan diukur di server saat ini dan bisa berbeda tiap kali.")
 
-    fig = go.Figure(go.Bar(
-        x=[1 - p, p], y=["Negatif", "Positif"], orientation="h",
-        marker_color=["#E0475B", "#17A2A0"], text=[f"{(1-p)*100:.1f}%", f"{p*100:.1f}%"],
-        textposition="outside",
-    ))
-    fig.update_layout(
-        height=150, margin=dict(l=10, r=40, t=10, b=10), xaxis=dict(range=[0, 1.15], visible=False),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="IBM Plex Sans, sans-serif"),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Jumlah kata", n_kata)
-    c2.metric("Kata dikenal model", f"{(dikenal / n_kata * 100) if n_kata else 0:.0f} %")
-    c3.metric("Token dipakai", min(n_kata, SEQ_LEN_TEXT))
-    if n_kata > SEQ_LEN_TEXT:
-        st.caption(f"Ulasan lebih dari {SEQ_LEN_TEXT} kata, jadi {n_kata - SEQ_LEN_TEXT} kata pertama tidak ikut dibaca model.")
-
-
-# --------------------------------------------------------------------------- #
-# Halaman: Versioning & Info
-# --------------------------------------------------------------------------- #
-def halaman_versioning():
-    st.markdown("## 🗂️ Versioning & info eksperimen")
-
-    st.markdown("### Riwayat versi deployment")
-    versi = pd.DataFrame([
-        {
-            "Tanggal": "10-09-2026", "Aplikasi": "SequenceLab", "Versi": "v1.0",
-            "Permasalahan": "Belum ada cara mudah mengecek prediksi vs nilai aktual; input suhu hanya lewat unggah CSV; "
-                            "sentimen hanya satu ulasan; tampilan bawaan Streamlit polos.",
-            "Pemecahan": "Deploy versi dasar dulu: 2 model dimuat, 1 input per model, output angka.",
-            "Pembaharuan fitur": "Rilis awal: prediksi suhu 1 jam (unggah CSV) dan klasifikasi sentimen 1 ulasan.",
-            "Lanjut ke versi berikutnya": "Ya → v2.0",
-            "Link": "ISI_LINK_STREAMLIT_V1",
-            "Dokumentasi": "screenshot/v1_*.png",
-        },
-        {
-            "Tanggal": "11-09-2026", "Aplikasi": "SequenceLab", "Versi": "v2.0 (final)",
-            "Permasalahan": "Pengguna lain sulit memahami cara pakai; belum ada visualisasi; model dimuat ulang tiap klik.",
-            "Pemecahan": "Desain ulang: tema warna & tipografi, halaman beranda dengan panduan, kartu hasil, grafik Plotly, "
-                         "st.cache_resource agar model hanya dimuat sekali (optimasi).",
-            "Pembaharuan fitur": "Data contoh bawaan + slider jendela waktu + pembanding nilai aktual; ramalan berantai s/d 12 jam; "
-                                 "contoh ulasan sekali klik; mode batch CSV/TXT + unduh hasil; indikator status model; halaman versioning.",
-            "Lanjut ke versi berikutnya": "Tidak (versi final)",
-            "Link": "ISI_LINK_STREAMLIT_V2",
-            "Dokumentasi": "screenshot/v2_*.png",
-        },
-    ])
-    st.dataframe(versi, hide_index=True, use_container_width=True)
-    st.caption("Ganti kolom Link dengan URL Streamlit tiap versi, dan simpan screenshot tiap versi di folder `screenshot/`.")
-
-    st.markdown("### Ringkasan eksperimen Week 3")
-    t1, t2 = st.tabs(["Jena Climate (regresi)", "IMDB (klasifikasi)"])
-    with t1:
-        jena = pd.DataFrame({
-            "Model": ["LSTM", "GRU", "LSTM", "GRU", "LSTM", "GRU", "LSTM", "GRU"],
-            "Konfigurasi": ["A", "A", "B", "B", "A", "A", "B", "B"],
-            "Seq": [24, 24, 24, 24, 72, 72, 72, 72],
-            "Params": [20033, 15233, 32417, 24609, 20033, 15233, 32417, 24609],
-            "Val Loss": [0.00781, 0.00720, 0.00833, 0.00791, 0.00679, 0.00695, 0.00763, 0.00775],
-            "MAE (°C)": [0.4981, 0.4804, 0.5127, 0.5102, 0.4772, 0.4782, 0.4989, 0.5063],
-            "RMSE (°C)": [0.7178, 0.6871, 0.7269, 0.7170, 0.6685, 0.6738, 0.7029, 0.7090],
-            "Waktu (s)": [129.9, 85.2, 72.9, 68.2, 120.0, 130.6, 96.5, 86.8],
-        })
-        st.dataframe(
-            jena.style.format({"Val Loss": "{:.5f}", "MAE (°C)": "{:.4f}", "RMSE (°C)": "{:.4f}", "Waktu (s)": "{:.1f}"})
-                .highlight_min(subset=["MAE (°C)", "RMSE (°C)"], color="#FFE3D6"),
-            hide_index=True, use_container_width=True,
-        )
-        st.caption("Dideploy: LSTM A seq 72 (baris tersorot).")
-    with t2:
-        imdb = pd.DataFrame({
-            "Model": ["LSTM", "GRU", "LSTM", "GRU", "LSTM", "GRU", "LSTM", "GRU"],
-            "Konfigurasi": ["A", "A", "B", "B", "A", "A", "B", "B"],
-            "Seq": [200, 200, 200, 200, 400, 400, 400, 400],
-            "Accuracy": [0.8735, 0.8736, 0.8754, 0.8720, 0.8686, 0.8935, 0.8766, 0.8834],
-            "Precision": [0.8522, 0.8885, 0.8661, 0.9093, 0.8489, 0.8865, 0.8649, 0.8558],
-            "Recall": [0.9049, 0.8556, 0.8891, 0.8275, 0.8982, 0.9036, 0.8937, 0.9234],
-            "F1": [0.8777, 0.8717, 0.8775, 0.8665, 0.8728, 0.8949, 0.8791, 0.8883],
-            "Waktu (s)": [32.9, 27.3, 35.9, 55.5, 35.1, 46.2, 94.8, 76.7],
-        })
-        st.dataframe(
-            imdb.style.format({c: "{:.4f}" for c in ["Accuracy", "Precision", "Recall", "F1"]} | {"Waktu (s)": "{:.1f}"})
-                .highlight_max(subset=["Accuracy", "F1"], color="#D6F3EF"),
-            hide_index=True, use_container_width=True,
-        )
-        st.caption("Dideploy: GRU A seq 400 (baris tersorot).")
-
-    st.markdown("### Struktur repo")
-    st.code(
-        """app.py                     # aplikasi ini
-requirements.txt
-.streamlit/config.toml     # tema warna
-models/
-  LSTM_A_seq72.h5          # model suhu
-  scaler.json              # mean & scale StandardScaler (13 fitur)
-  sample_jena.csv          # data contoh per jam (opsional, dari data uji)
-  GRU_A_seq400.h5          # model sentimen
-  tokenizer.json           # word_index tokenizer (vocab 20.000)
-screenshot/                # dokumentasi tiap versi""",
-        language="text",
-    )
+    st.divider()
+    st.subheader("Riwayat versi")
+    vp = find_file("versioning.csv")
+    if vp is not None:
+        try:
+            st.dataframe(pd.read_csv(vp), hide_index=True, use_container_width=True)
+        except Exception:
+            st.caption("versioning.csv ada tetapi tidak bisa dibaca.")
+    else:
+        st.markdown(
+            "| Versi | Isi |\n|---|---|\n"
+            "| v1 | Satu model per aplikasi, input dasar, tampilan bawaan Streamlit. |\n"
+            "| v2 | Desain baru, dua model dalam satu aplikasi, uji rentang waktu, perbandingan model, "
+            "sorotan kata berpengaruh, unggah CSV, dan mode TFLite terkuantisasi. |")
+    st.caption(f"Runtun {APP_VERSION}. Akmal Nugraha Saputra, 2609, MBC LAS 2026.")
 
 
-# --------------------------------------------------------------------------- #
-# Router
-# --------------------------------------------------------------------------- #
-if halaman == "Beranda":
-    halaman_beranda()
-elif halaman.startswith("Prediksi Suhu"):
-    halaman_suhu()
-elif halaman.startswith("Analisis Sentimen"):
-    halaman_sentimen()
-else:
-    halaman_versioning()
+# ---------------------------------------------------------------------------
+# Navigasi
+# ---------------------------------------------------------------------------
+PAGES: dict = {}
 
-st.markdown(
-    f'<div class="footer">SequenceLab {APP_VERSION} · Tugas Week 5 Deployment & MLOps · '
-    f"Akmal Nugraha Saputra (2609)</div>",
-    unsafe_allow_html=True,
-)
+
+def run(only: str | None = None) -> None:
+    """only=None -> aplikasi lengkap; only='suhu' / 'sentimen' -> satu model saja (untuk link terpisah)."""
+    st.set_page_config(page_title="Runtun: suhu dan ulasan", page_icon=":material/stacked_line_chart:",
+                       layout="wide", initial_sidebar_state="collapsed")
+    try:
+        alt.theme.register("runtun", enable=True)(altair_theme)
+    except Exception:
+        alt.themes.register("runtun", altair_theme)
+        alt.themes.enable("runtun")
+    inject_css()
+
+    PAGES["home"] = st.Page(page_home, title="Beranda", icon=":material/home:", url_path="beranda", default=only is None)
+    PAGES["suhu"] = st.Page(page_forecast, title="Prakiraan suhu", icon=":material/thermostat:",
+                            url_path="prakiraan-suhu", default=only == "suhu")
+    PAGES["sentimen"] = st.Page(page_sentiment, title="Pembaca ulasan", icon=":material/movie:",
+                                url_path="pembaca-ulasan", default=only == "sentimen")
+    PAGES["about"] = st.Page(page_about, title="Tentang model", icon=":material/info:", url_path="tentang")
+
+    if only == "suhu":
+        pages = [PAGES["suhu"], PAGES["about"]]
+    elif only == "sentimen":
+        pages = [PAGES["sentimen"], PAGES["about"]]
+    else:
+        pages = [PAGES["home"], PAGES["suhu"], PAGES["sentimen"], PAGES["about"]]
+    st.navigation(pages, position="top").run()
+
+
+if __name__ == "__main__":
+    run()
