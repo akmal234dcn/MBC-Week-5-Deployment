@@ -313,27 +313,39 @@ def build_tflite(path: str) -> bytes:
         return conv.convert()
 
 
-def run_model(path: str, X: np.ndarray, engine: str) -> tuple[np.ndarray, float]:
-    """Mengembalikan (prediksi, milidetik per sampel)."""
+TFLITE_FAILED: set = set()  # model yang tidak bisa dijalankan TFLite di server ini
+
+
+def _run_tflite(path: str, X: np.ndarray) -> tuple[np.ndarray, float]:
+    tf = get_tf()
+    interp = tf.lite.Interpreter(model_content=build_tflite(path))
+    interp.allocate_tensors()
+    inp, outp = interp.get_input_details()[0], interp.get_output_details()[0]
+    preds = np.empty(len(X), dtype=np.float32)
     t0 = time.perf_counter()
+    for k in range(len(X)):
+        interp.set_tensor(inp["index"], X[k:k + 1].astype(inp["dtype"]))
+        interp.invoke()
+        preds[k] = interp.get_tensor(outp["index"]).ravel()[0]
+    return preds, (time.perf_counter() - t0) * 1000 / max(len(X), 1)
+
+
+def run_model(path: str, X: np.ndarray, engine: str) -> tuple[np.ndarray, float]:
+    """Mengembalikan (prediksi, milidetik per sampel).
+    Jika mode TFLite gagal untuk model tertentu, otomatis kembali ke Keras supaya aplikasi tidak berhenti."""
+    if engine == "tflite" and path not in TFLITE_FAILED:
+        try:
+            return _run_tflite(path, X)
+        except Exception:
+            TFLITE_FAILED.add(path)
     if engine == "tflite":
-        tf = get_tf()
-        interp = tf.lite.Interpreter(model_content=build_tflite(path))
-        interp.allocate_tensors()
-        inp, outp = interp.get_input_details()[0], interp.get_output_details()[0]
-        preds = np.empty(len(X), dtype=np.float32)
-        t0 = time.perf_counter()
-        for k in range(len(X)):
-            interp.set_tensor(inp["index"], X[k:k + 1].astype(inp["dtype"]))
-            interp.invoke()
-            preds[k] = interp.get_tensor(outp["index"]).ravel()[0]
-    else:
-        model = load_keras(path)
-        t0 = time.perf_counter()
-        parts = [model(X[i:i + 256], training=False).numpy().ravel() for i in range(0, len(X), 256)]
-        preds = np.concatenate(parts) if parts else np.array([])
-    ms = (time.perf_counter() - t0) * 1000 / max(len(X), 1)
-    return preds, ms
+        st.caption(":material/info: Mode TFLite belum didukung untuk model ini di server, "
+                   "jadi prediksi memakai Keras (.h5). Hasilnya tetap sama.")
+    model = load_keras(path)
+    t0 = time.perf_counter()
+    parts = [model(X[i:i + 256], training=False).numpy().ravel() for i in range(0, len(X), 256)]
+    preds = np.concatenate(parts) if parts else np.array([])
+    return preds, (time.perf_counter() - t0) * 1000 / max(len(X), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +510,7 @@ def missing_box(what: str, files: str) -> None:
 
 def engine_picker(key: str) -> str:
     choice = st.segmented_control(
-        "Mesin prediksi", ["Keras (.h5)", "TFLite ringan"], default="TFLite ringan", key=key,
+        "Mesin prediksi", ["Keras (.h5)", "TFLite ringan"], default="Keras (.h5)", key=key,
         help="TFLite ringan memakai model yang dikuantisasi ke int8: ukurannya sekitar 4 kali lebih kecil "
              "dan biasanya lebih cepat untuk satu prediksi. Hasilnya hampir sama dengan Keras.",
     )
@@ -701,7 +713,7 @@ def forecast_single(models, chosen, engine, scaled, temps, times, t_mean, t_std,
         st.markdown(f"**{seq} jam yang dibaca model**")
         legend_chips([("Riwayat suhu", INK, "line"), ("Tebakan model", WARM, "dot")]
                      + ([("Suhu sebenarnya", COLD, "diamond")] if actual is not None else []))
-        st.altair_chart((base + dots).properties(height=300), use_container_width=True)
+        st.altair_chart((base + dots).properties(height=300), width="stretch")
 
     # garis warna 72 jam (konteks cepat)
     st.markdown(stripes_html(temps[pos - seq:pos], -10, 30, small=True), unsafe_allow_html=True)
@@ -761,9 +773,9 @@ def forecast_range(models, chosen, engine, scaled, temps, times, t_mean, t_std, 
             strokeDash=alt.condition(alt.datum.seri == "Suhu sebenarnya", alt.value([1, 0]), alt.value([5, 3])),
             tooltip=["seri:N", alt.Tooltip("waktu:T", format="%d/%m %H.00"), alt.Tooltip("suhu:Q", format=".2f")])
         legend_chips([(ser, col, "line" if ser == "Suhu sebenarnya" else "dash") for ser, col in zip(series, palette)])
-        st.altair_chart(chart.properties(height=340).interactive(bind_y=False), use_container_width=True)
+        st.altair_chart(chart.properties(height=340).interactive(bind_y=False), width="stretch")
         st.dataframe(res.style.format({"MAE (°C)": "{:.3f}", "RMSE (°C)": "{:.3f}", "Waktu per tebakan (ms)": "{:.2f}"}),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
         out = plot.pivot_table(index="waktu", columns="seri", values="suhu").reset_index()
         st.download_button("Unduh hasil (CSV)", out.to_csv(index=False).encode(), "prakiraan_suhu.csv", "text/csv")
 
@@ -912,7 +924,7 @@ def sentiment_batch(chosen, tok, L) -> None:
         st.write("")
         view = data.copy()
         view[tcol] = view[tcol].astype(str).map(lambda t: t if len(t) <= 140 else t[:140] + "...")
-        st.dataframe(view, hide_index=True, use_container_width=True,
+        st.dataframe(view, hide_index=True, width="stretch",
                      column_config={"prob_positif": st.column_config.ProgressColumn(
                          "Keyakinan positif", min_value=0.0, max_value=1.0, format="%.2f")})
         st.download_button("Unduh hasil (CSV)", data.to_csv(index=False).encode(), "hasil_sentimen.csv", "text/csv")
@@ -973,15 +985,19 @@ def page_about() -> None:
             xb = np.repeat(x, 20, axis=0)
             run_model(str(d["path"]), x, "keras")
             _, ms_k = run_model(str(d["path"]), xb, "keras")
-            tfl = build_tflite(str(d["path"]))
-            _, ms_t = run_model(str(d["path"]), xb, "tflite")
             _, ms_k1 = run_model(str(d["path"]), x, "keras")
-            rows.append({"Model": d["path"].name, "Ukuran .h5": file_size(d["path"]),
-                         "Ukuran TFLite": f"{len(tfl) / 1024 / 1024:.2f} MB" if len(tfl) > 1048576 else f"{len(tfl) / 1024:.0f} KB",
-                         "Keras, 1 tebakan (ms)": round(ms_k1, 2), "TFLite, 1 tebakan (ms)": round(ms_t, 2)})
+            try:
+                tfl = build_tflite(str(d["path"]))
+                _, ms_t = _run_tflite(str(d["path"]), xb)
+                size_t = f"{len(tfl) / 1024 / 1024:.2f} MB" if len(tfl) > 1048576 else f"{len(tfl) / 1024:.0f} KB"
+                ms_t = round(ms_t, 2)
+            except Exception:
+                size_t, ms_t = "tidak didukung", None
+            rows.append({"Model": d["path"].name, "Ukuran .h5": file_size(d["path"]), "Ukuran TFLite": size_t,
+                         "Keras, 1 tebakan (ms)": round(ms_k1, 2), "TFLite, 1 tebakan (ms)": ms_t})
             prog.progress((n + 1) / len(allm))
         prog.empty()
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption("Ukuran .h5 termasuk state optimizer dari training. Kecepatan diukur di server saat ini dan bisa berbeda tiap kali.")
 
     st.divider()
@@ -989,7 +1005,7 @@ def page_about() -> None:
     vp = find_file("versioning.csv")
     if vp is not None:
         try:
-            st.dataframe(pd.read_csv(vp), hide_index=True, use_container_width=True)
+            st.dataframe(pd.read_csv(vp), hide_index=True, width="stretch")
         except Exception:
             st.caption("versioning.csv ada tetapi tidak bisa dibaca.")
     else:
